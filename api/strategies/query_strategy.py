@@ -1,0 +1,152 @@
+"""
+Query routing strategy: decides whether a chatbot question needs
+SQL-style aggregation (via CaseRepository) or semantic/RAG search
+(via ChromaDB) -- the exact fork flagged when we first planned the
+chatbot. Two questions like "which district has the most thefts" vs
+"tell me about cases involving a stolen motorbike near a bus stand"
+need fundamentally different retrieval, not just different phrasing.
+
+This is intentionally a simple keyword-heuristic classifier for the
+MVP, not an LLM-based classifier -- cheaper, faster, and good enough
+for a datathon demo. Swap for an LLM-based classifier later if the
+heuristic misses too often.
+"""
+import re
+from abc import ABC, abstractmethod
+from typing import Any
+
+from domain.interfaces.case_repository import CaseRepository
+
+AGGREGATE_KEYWORDS = [
+    "how many", "count", "most", "least", "highest", "lowest", "trend",
+    "compare", "average", "total", "which district", "over time",
+    "increase", "decrease", "rate", "statistics", "stats", "breakdown",
+]
+
+# Questions asking to enumerate specific people, not aggregate stats.
+# Checked BEFORE the aggregate keywords below, since phrases like
+# "list all" or "how many criminals are there" could otherwise get
+# mis-routed to the district/crime-type SQL summary, which has no
+# person-level data in it at all.
+ENTITY_LIST_KEYWORDS = [
+    "list all", "list the", "criminals", "accused", "offenders",
+    "suspects", "who are the", "show me all",
+]
+
+
+class QueryStrategy(ABC):
+    @abstractmethod
+    def build_context(self, query: str, repo: CaseRepository) -> str:
+        """Return a text context block to feed into the LLM prompt."""
+        ...
+
+
+class SQLQueryStrategy(QueryStrategy):
+    """For aggregate/statistical questions -- pulls structured summaries
+    from the repository rather than individual case text."""
+
+    def build_context(self, query: str, repo: CaseRepository) -> str:
+        total = repo.get_total_case_count()
+        district_counts = repo.get_district_counts()
+        crime_counts = repo.get_crime_type_counts()
+        trend = repo.get_monthly_trend()
+
+        # Exact total, from a real COUNT query -- NOT derived by having
+        # the LLM sum the (possibly truncated) breakdown below. This was
+        # a real bug: "how many cases do we have" was previously being
+        # answered by the model summing a district list capped at 15
+        # rows, silently wrong once there are more districts than that.
+        lines = [f"Total case count (exact): {total}"]
+
+        lines.append("\nDistrict-wise case counts:")
+        for row in district_counts[:15]:
+            lines.append(f"  {row['district']}: {row['count']}")
+        if len(district_counts) > 15:
+            lines.append(f"  ...and {len(district_counts) - 15} more districts not shown.")
+
+        lines.append("\nCrime-type counts:")
+        for row in crime_counts[:15]:
+            lines.append(f"  {row['crime_type']}: {row['count']}")
+        if len(crime_counts) > 15:
+            lines.append(f"  ...and {len(crime_counts) - 15} more crime types not shown.")
+
+        lines.append("\nMonthly case volume (most recent first):")
+        for row in trend[-12:]:
+            lines.append(f"  {row['month']}: {row['count']}")
+
+        return "\n".join(lines)
+
+
+class EntityListStrategy(QueryStrategy):
+    """For 'list all accused/criminals/offenders/suspects' style
+    questions -- pulls real rows from the Accused table. Semantic
+    search over case briefs cannot answer these at all, since the
+    embedded case text never includes accused names."""
+
+    def __init__(self, limit: int = 50):
+        self.limit = limit
+
+    def build_context(self, query: str, repo: CaseRepository) -> str:
+        accused = repo.get_accused_list(limit=self.limit)
+        if not accused:
+            return "No accused records found."
+
+        lines = [f"Accused persons on record (showing up to {self.limit}):"]
+        for a in accused:
+            lines.append(
+                f"  {a['accused_name']} (age {a['age']}, gender {a['gender']}) — "
+                f"FIR {a['crime_no']}, {a['crime_type']}, status: {a['case_status']}"
+            )
+        return "\n".join(lines)
+
+
+class SemanticSearchStrategy(QueryStrategy):
+    """For questions about specific case details/circumstances -- pulls
+    relevant case text via ChromaDB similarity search.
+
+    IMPORTANT: the fir_cases collection was populated with precomputed
+    Gemini embeddings (see rag/embed.py), NOT ChromaDB's default
+    auto-embedder. So the query text must also be embedded via Gemini
+    before searching -- querying with raw query_texts= would silently
+    try to use ChromaDB's default embedder instead, which is wrong and
+    also requires downloading a model ChromaDB doesn't ship with."""
+
+    def __init__(self, top_k: int = 5):
+        self.top_k = top_k
+
+    def build_context(self, query: str, repo: CaseRepository) -> str:
+        import os
+        import chromadb
+        from google import genai
+
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        embed_result = client.models.embed_content(
+            model="gemini-embedding-001", contents=[query]
+        )
+        query_embedding = embed_result.embeddings[0].values
+
+        chroma_client = chromadb.PersistentClient(path="./chroma_store")
+        collection = chroma_client.get_or_create_collection(name="fir_cases")
+
+        results = collection.query(query_embeddings=[query_embedding], n_results=self.top_k)
+        docs = results.get("documents", [[]])[0]
+
+        if not docs:
+            return "No matching case records found."
+
+        return "Relevant case records:\n" + "\n---\n".join(docs)
+
+
+def classify_query(query: str) -> QueryStrategy:
+    """Simple keyword heuristic. Checks entity-list keywords first (e.g.
+    'list all accused'), since those questions want person-level rows,
+    not the district/crime-type aggregate summary -- checking aggregate
+    keywords first would misroute 'list all criminals' style questions
+    just because they contain no aggregate word, or worse, silently
+    answer from an aggregate table with no person data in it."""
+    q_lower = query.lower()
+    if any(kw in q_lower for kw in ENTITY_LIST_KEYWORDS):
+        return EntityListStrategy()
+    if any(re.search(rf"\b{re.escape(kw)}\b", q_lower) for kw in AGGREGATE_KEYWORDS):
+        return SQLQueryStrategy()
+    return SemanticSearchStrategy()

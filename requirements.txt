@@ -1,0 +1,12 @@
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
+faker==40.28.1
+python-dotenv==1.2.2
+chromadb==1.5.9
+google-genai==1.65.0
+zcatalyst-sdk==1.4.0
+typing_extensions~=4.12.1
+fastapi==0.138.2
+uvicorn==0.50.2
+pydantic==2.11.0
+slowapi==0.1.9

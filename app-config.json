@@ -1,0 +1,8 @@
+{
+    "command": "sh -c \"uvicorn api.main:app --host 0.0.0.0 --port $X_ZOHO_CATALYST_LISTEN_PORT\"",
+    "build_path": ".",
+    "stack": "python_3_13",
+    "env_variables": {},
+    "memory": 512,
+    "scripts": {}
+}

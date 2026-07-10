@@ -1,0 +1,19 @@
+{
+  "appsail": [
+    {
+      "source": ".",
+      "name": "vetro-ai-backend",
+      "ignore": [
+        "vetro-ai-frontend",
+        ".venv",
+        "venv",
+        "node_modules",
+        "chroma_store",
+        "__pycache__",
+        ".git",
+        ".pytest_cache",
+        "docs"
+      ]
+    }
+  ]
+}

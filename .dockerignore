@@ -1,0 +1,15 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.venv/
+venv/
+chroma_store/
+*.sqlite3
+*.db
+vetro-ai-frontend/node_modules/
+vetro-ai-frontend/dist/
+.git/
+.pytest_cache/
+docs/
+*.log

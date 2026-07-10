@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytype/
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+.env.local
+.env.*.local
+*.pem
+.catalystrc
+
+# Node / frontend
+node_modules/
+vetro-ai-frontend/node_modules/
+vetro-ai-frontend/dist/
+vetro-ai-frontend/dist-ssr/
+vetro-ai-frontend/.vite/
+vetro-ai-frontend/.parcel-cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local runtime data and databases
+chroma_store/
+*.sqlite3
+*.db
+*.db-journal
+
+# Catalyst SDK downloaded runtime/build cache (regenerated on deploy)
+.catalyst-cache/
+catalyst-appsail-build/
+
+# Logs
+logs/
+*.log
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
