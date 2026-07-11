@@ -25,8 +25,8 @@ needed zero changes despite the swap underneath it.
 """
 from typing import AsyncIterator
 
+from api.strategies.query_classifier import classify_query_llm
 from api.strategies.query_rewriter import rewrite_query
-from api.strategies.query_strategy import classify_query
 from infrastructure.llm.llm_factory import get_llm_provider
 from infrastructure.persistence.conversation_repository_factory import (
     get_conversation_repository,
@@ -59,8 +59,15 @@ class ChatService:
 
         retrieval_query = await rewrite_query(user_query, history, self.llm)
 
-        strategy = classify_query(retrieval_query)
-        context = strategy.build_context(retrieval_query, self.repo)
+        # classify_query_llm(), not the old keyword-only classify_query(),
+        # since English-keyword matching can't classify Kannada/Kannalish
+        # questions at all -- see api/strategies/query_classifier.py.
+        # english_query is used for retrieval (SemanticSearchStrategy
+        # embeds against an all-English ChromaDB collection); the
+        # ORIGINAL user_query is still what goes in the final prompt
+        # below, so the model responds in whatever language was asked.
+        strategy, english_query = await classify_query_llm(retrieval_query, self.llm)
+        context = strategy.build_context(english_query, self.repo)
 
         history_block = self._format_history(history)
 
@@ -81,6 +88,10 @@ Format your answer in Markdown so it renders cleanly in the UI:
 If the question refers back to something discussed earlier in the conversation (e.g. "that
 case", "the second one", "what about the other district"), use the conversation history
 below to resolve what it's referring to.
+
+Respond in the same language the question below is asked in -- English, Kannada, or a
+Kannada/English mix (Kannalish). Match the user's language and style; do not translate
+your answer into a different language than the question unless explicitly asked to.
 
 Conversation history so far:
 {history_block}

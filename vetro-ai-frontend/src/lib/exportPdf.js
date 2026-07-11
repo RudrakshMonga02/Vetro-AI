@@ -18,6 +18,57 @@ let jsPDFCtor = null;
 let markdownParser = null;
 let mdastToString = null;
 
+// jsPDF's built-in core fonts (Helvetica/Courier) only support WinAnsi
+// encoding -- Kannada script (or any non-Latin script) silently comes
+// out as mangled/garbage glyphs, not an error. Embedding a real Unicode
+// font (Noto Sans Kannada, OFL-1.1, files in public/fonts/) is the only
+// fix. Fetched once and cached as base64 -- these are ~115KB each, not
+// worth re-fetching per export.
+const KANNADA_FONT_FAMILY = "NotoSansKannada";
+// U+0C80-U+0CFF: the Unicode "Kannada" block. Escaped explicitly
+// (rather than pasting the literal glyphs) so the range is
+// unambiguous regardless of how this file's encoding gets handled.
+const KANNADA_RANGE_RE = /[\u0C80-\u0CFF]/;
+let kannadaFontsPromise = null;
+
+function containsKannada(text) {
+  return KANNADA_RANGE_RE.test(text || "");
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function loadKannadaFonts() {
+  if (!kannadaFontsPromise) {
+    kannadaFontsPromise = Promise.all([
+      fetch("/fonts/NotoSansKannada-Regular.ttf").then((r) => r.arrayBuffer()),
+      fetch("/fonts/NotoSansKannada-Bold.ttf").then((r) => r.arrayBuffer()),
+    ]).then(([regular, bold]) => ({
+      regular: arrayBufferToBase64(regular),
+      bold: arrayBufferToBase64(bold),
+    }));
+  }
+  return kannadaFontsPromise;
+}
+
+// Registered per jsPDF document instance -- addFileToVFS()/addFont()
+// are instance-scoped, not global, so this needs to run once per
+// exportConversationToPdf() call rather than once per module load.
+async function registerKannadaFont(doc) {
+  const fonts = await loadKannadaFonts();
+  doc.addFileToVFS("NotoSansKannada-Regular.ttf", fonts.regular);
+  doc.addFont("NotoSansKannada-Regular.ttf", KANNADA_FONT_FAMILY, "normal");
+  doc.addFileToVFS("NotoSansKannada-Bold.ttf", fonts.bold);
+  doc.addFont("NotoSansKannada-Bold.ttf", KANNADA_FONT_FAMILY, "bold");
+}
+
 async function ensureLibsLoaded() {
   if (jsPDFCtor) return;
   const [{ jsPDF }, { unified }, { default: remarkParse }, { default: remarkGfm }, mdastUtil] =
@@ -141,14 +192,25 @@ function inlineToWords(nodes, style = {}) {
 }
 
 function setWordFont(doc, word, baseSize) {
-  const family = word.code ? "courier" : "helvetica";
+  const isKannada = !word.code && containsKannada(word.text);
+  let family = word.code || word.monospace ? "courier" : "helvetica";
   let variant = "normal";
   if (word.bold && word.italic) variant = "bolditalic";
   else if (word.bold) variant = "bold";
   else if (word.italic) variant = "italic";
+
+  if (isKannada) {
+    // The embedded Kannada font only has normal/bold weights (no
+    // italic/bolditalic) -- fall back to bold-or-normal rather than
+    // asking jsPDF for a variant that was never registered.
+    family = KANNADA_FONT_FAMILY;
+    variant = word.bold ? "bold" : "normal";
+  }
+
   doc.setFont(family, variant);
   doc.setFontSize(word.code ? baseSize - 1 : baseSize);
-  if (word.link) doc.setTextColor(...COLOR.heading);
+  if (word.color) doc.setTextColor(...word.color);
+  else if (word.link) doc.setTextColor(...COLOR.heading);
   else if (word.code) doc.setTextColor(...COLOR.code);
   else doc.setTextColor(...COLOR.body);
 }
@@ -340,10 +402,17 @@ function renderTable(cursor, node, x, width) {
       doc.setFillColor(...COLOR.tableHeaderBg);
       doc.rect(x, cursor.y - 3.6, width, lineHeight, "F");
     }
-    doc.setFont("helvetica", isHeader ? "bold" : "normal");
     doc.setFontSize(9);
     doc.setTextColor(...COLOR.body);
     row.forEach((cellText, colIndex) => {
+      // Font set per-cell, not once per row -- a cell can contain
+      // Kannada text needing the embedded Unicode font while its
+      // neighbors stay on helvetica.
+      const variant = isHeader ? "bold" : "normal";
+      doc.setFont(
+        containsKannada(cellText) ? KANNADA_FONT_FAMILY : "helvetica",
+        variant
+      );
       const cellX = x + colIndex * colWidth + 1.5;
       const truncated = doc.splitTextToSize(cellText, colWidth - 3)[0] || "";
       doc.text(truncated, cellX, cursor.y);
@@ -410,19 +479,21 @@ export async function exportConversationToPdf(messages, title) {
   await ensureLibsLoaded();
 
   const doc = new jsPDFCtor({ unit: "mm", format: "a4" });
+  await registerKannadaFont(doc);
   const cursor = newCursor(doc);
 
-  doc.setFont("courier", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(...COLOR.heading);
-  const titleLines = doc.splitTextToSize(
-    (title || "Untitled Investigation").toUpperCase(),
-    CONTENT_WIDTH
-  );
-  for (const line of titleLines) {
-    doc.text(line, MARGIN_X, cursor.y);
-    cursor.y += 6;
-  }
+  // Word-by-word (not doc.splitTextToSize on the whole string) so a
+  // title that mixes English and Kannada -- e.g. auto-generated from a
+  // Kannada first message -- gets each word measured/rendered in the
+  // right font, the same way body text does. "monospace" keeps the
+  // English portion in the terminal-style courier look; Kannada words
+  // still switch to the embedded Unicode font regardless.
+  const titleWords = (title || "Untitled Investigation")
+    .toUpperCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => ({ text: w, bold: true, monospace: true, color: COLOR.heading }));
+  printWords(cursor, titleWords, MARGIN_X, CONTENT_WIDTH, 13, 6);
 
   doc.setFont("helvetica", "normal");
   doc.setFontSize(8.5);

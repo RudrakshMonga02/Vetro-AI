@@ -599,3 +599,97 @@ current priority order.
   `exportPdf.js` both now show up correctly as addable. **Worth a repo-wide double check next time
   there's a "why is this file missing after clone" surprise** -- this class of bug (silently-ignored
   file, no error, no warning) is exactly the kind that survives unnoticed across many commits.
+
+- **[Feature — multilingual chat: English, Kannada, Kannalish]** Second item off the chat feature
+  list (see PDF export entry above). Root problem: `classify_query()` (`query_strategy.py`) is a
+  plain English-keyword heuristic ("how many", "list all", etc.) -- silently wrong for Kannada
+  script or Kannalish (romanized/code-mixed Kannada+English), since none of those literal phrases
+  appear in non-English text; every such question was falling through to `SemanticSearchStrategy`
+  regardless of actual intent, with no error to signal the misroute. Added
+  `api/strategies/query_classifier.py`: one small LLM call (`classify_query_llm()`) that classifies
+  intent into AGGREGATE/ENTITY_LIST/SEMANTIC by *meaning* rather than literal English words, and
+  also returns an English gloss of the query -- needed specifically for `SemanticSearchStrategy`,
+  since the `fir_cases` ChromaDB collection was embedded from English `BriefFacts` text
+  (`rag/embed.py`); translating a Kannada/Kannalish query before embedding it is the safe choice
+  rather than gambling on cross-lingual embedding alignment. `SQLQueryStrategy`/`EntityListStrategy`
+  don't use the query text at all (they pull structured aggregates/rows regardless of phrasing), so
+  the gloss is irrelevant to those but harmless. Degrades to the old keyword heuristic if the LLM
+  call fails or returns something unparseable, same "don't crash the turn" pattern as
+  `query_rewriter.py`. `chat_service.py` now calls `classify_query_llm()` instead of `classify_query()`
+  directly, passes the English gloss into `build_context()`, but still puts the user's ORIGINAL
+  (untranslated) query in the final answer prompt -- which now also explicitly instructs the model
+  to respond in whichever language the question was asked in (English/Kannada/Kannalish), rather
+  than defaulting to English.
+  **Real bug found and root-caused, not glossed over, while testing this:** a direct test of
+  `classify_query_llm()` against real Kannada-script questions initially showed *wrong* category
+  (fell through to SEMANTIC) and an untranslated English gloss -- looked exactly like a
+  classification defect. Root cause, found by inspecting the raw LLM response instead of guessing:
+  a genuine `429 RESOURCE_EXHAUSTED` -- this Gemini key's free tier allows only **20 requests/day**
+  for `gemini-3.5-flash` (what the `gemini-flash-latest` alias, pinned in the previous session's
+  model-deprecation fix, currently resolves to), and that quota was already exhausted from the
+  session's cumulative testing. The fallback-to-keyword-heuristic path fired exactly as designed
+  (a quota error is just another "LLM call failed" case) -- the *keyword heuristic itself* correctly
+  can't classify Kannada text, which is its known, accepted limitation as a fallback, not a new bug.
+  Tried pinning to `gemini-2.0-flash` for a presumably friendlier quota instead -- worse: `limit: 0`
+  for this key specifically (an access restriction, not exhaustion -- this key's free tier appears
+  scoped to the current model generation only). Landed on `gemini-flash-lite-latest` (currently
+  resolves to `gemini-3.1-flash-lite`), confirmed reachable and, being the lite tier of the same
+  generation, likely to carry a friendlier free quota than the full-size flash model. Re-verified
+  against real Kannada script on the new model: correct `CATEGORY: AGGREGATE` /
+  `ENGLISH: How many total cases are there?` and `CATEGORY: ENTITY_LIST` /
+  `ENGLISH: Give a list of all the accused.` for the same two questions that failed under quota
+  exhaustion. Full round-trip re-verified live against the running backend: a Kannada "ಒಟ್ಟು ಎಷ್ಟು
+  ಪ್ರಕರಣಗಳಿವೆ?" ("how many total cases are there?") correctly returned `SQLQueryStrategy`'s exact
+  count and answered in Kannada ("ಒಟ್ಟು **500** ಪ್ರಕರಣಗಳಿವೆ."); an English "list all the accused
+  criminals" query re-confirmed correct on the new model too (real accused names/ages/genders from
+  the DB, not hallucinated). **Not yet tested: Kannalish through the live `/chat/` endpoint**
+  (only tested at the classifier level, which worked) **and a semantic (non-aggregate,
+  non-entity-list) Kannada/Kannalish question**, to confirm the English-gloss-for-embedding path
+  actually improves retrieval quality against the English-only ChromaDB collection, not just that
+  classification routes correctly.
+  **Pre-existing constraint now confirmed sharply, not just theorized:** this free-tier key's daily
+  quota is a real, current limitation on how much live testing/demoing is possible in one day --
+  worth moving to a billing-enabled key before relying on this for the actual submission demo.
+
+- **[Bug fix — Kannada text unreadable in exported PDFs]** User manually tested the multilingual
+  chat feature above, then tested PDF export against a Kannada conversation, and reported the
+  Kannada text came out as mangled/unreadable glyphs (screenshot: garbage characters where Kannada
+  script should be). Root cause: jsPDF's built-in core fonts (Helvetica/Courier) only support
+  WinAnsi encoding -- Latin script and a handful of symbols, nothing else. Kannada (or any
+  non-Latin script) silently maps to whatever glyph happens to sit at that byte position in the
+  WinAnsi table, producing readable-looking garbage instead of an error -- exactly what the
+  screenshot showed. Fixed by embedding a real Unicode font (Noto Sans Kannada, SIL OFL-1.1
+  license) into the PDF. Sourced via `@fontsource/noto-sans-kannada` (npm), which only ships
+  WOFF/WOFF2 -- jsPDF's font embedding needs raw TTF -- so decompressed the WOFF2 files back to
+  TTF with `wawoff2` (Google's own compressor/decompressor) as a one-time local conversion step,
+  not a runtime or shipped dependency; only the resulting two TTF files (regular + bold weight,
+  ~116KB each) plus the OFL license text ended up in `vetro-ai-frontend/public/fonts/`. At export
+  time, `exportPdf.js` fetches these once (cached), registers them into the jsPDF document via
+  `addFileToVFS()`/`addFont()`, and -- critically -- switches font **per word**, not per document
+  or per line: `containsKannada()` (a `ಀ`-`೿` Unicode-range test) checks each word before
+  it's drawn, so a single sentence mixing English and Kannada (a realistic Kannalish response)
+  renders each script in the correct font without the caller needing to know in advance which
+  parts are which. This also applies to the document title (auto-generated from the first message,
+  which could itself be Kannada -- rewrote the title from a single `doc.splitTextToSize()` call
+  into the same word-by-word `printWords()` path body text already uses) and table cells (checked
+  per-cell rather than per-row, since a GFM table could have Kannada content in some columns and
+  not others). Deliberately embeds only ONE weight combination usable (`NotoSansKannada`
+  normal/bold) -- there's no italic Kannada weight, so bold-italic Kannada words fall back to
+  plain bold rather than erroring; a known, accepted simplification, not worth a third font file
+  for something markdown rarely produces in practice.
+  **Verified without spending live Gemini quota:** rather than generating new Kannada chat
+  responses (today's free-tier quota is the active constraint from the previous entry), seeded a
+  test conversation directly into the (shared Supabase) database with Kannada, Kannalish, and
+  mixed-script content -- including a deliberately mixed sentence ("Here's a mixed
+  English+Kannada test: **ಪ್ರಕರಣ** count is important.") to stress the per-word font-switching
+  logic specifically. Exported it via a real Playwright-driven browser session, then verified with
+  `pypdf` text extraction (the strongest available check -- it proves the actual embedded
+  character codepoints and glyph mapping are correct, not just "looks plausible" in a screenshot):
+  every line -- title, numbered list with Kannada district names, blockquote, and the mixed-script
+  sentence -- extracted back out correctly and in order. (A node-canvas-based visual render was
+  also attempted for a picture-level check, but hit the same unrelated font-glyph-path rendering
+  bug in that specific tool as an earlier PDF-export entry -- not pursued further, since text
+  extraction is the more rigorous proof anyway and real PDF viewers use a completely different,
+  mature rendering path than that one Node tool.) Deleted the seeded test conversation from the
+  shared database afterward -- it was real test data sitting in the same Supabase instance the
+  actual app uses, not a disposable local sandbox.

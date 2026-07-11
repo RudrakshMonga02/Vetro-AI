@@ -15,11 +15,20 @@ load_dotenv()
 
 
 class GeminiProvider(LLMProvider):
-    # "gemini-flash-latest" is Google's floating alias to the current
-    # recommended flash model -- pinning an exact version (e.g.
-    # "gemini-2.5-flash") breaks silently once Google deprecates it for
-    # new API keys, which is exactly what happened here.
-    def __init__(self, model: str = "gemini-flash-latest"):
+    # "gemini-flash-latest" resolves to gemini-3.5-flash, whose free-tier
+    # quota is a mere 20 requests/day -- exhausted within a single
+    # dev/testing session. Tried pinning to an older model
+    # (gemini-2.0-flash) for a presumably friendlier quota instead, but
+    # this API key's free tier has ZERO quota for it (confirmed:
+    # `limit: 0` in the 429 response, not just "exhausted" -- this key's
+    # free tier appears restricted to the current model generation only,
+    # older generations aren't available at all, not just rate-limited).
+    # "gemini-flash-lite-latest" (-> gemini-3.1-flash-lite as of this
+    # writing) is confirmed reachable on this key and, being the lite
+    # tier of the same generation, should carry a friendlier free quota
+    # than the full-size flash model. Revisit if/when this project moves
+    # to a billing-enabled key, where quota stops being the constraint.
+    def __init__(self, model: str = "gemini-flash-lite-latest"):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = model
 
