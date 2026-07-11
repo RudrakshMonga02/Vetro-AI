@@ -117,6 +117,7 @@ export default function ChatApp() {
       />
       <ChatInterface
         conversationId={activeConversationId}
+        conversationTitle={conversations.find((c) => c.id === activeConversationId)?.title}
         onMessageSent={loadConversations}
       />
     </div>

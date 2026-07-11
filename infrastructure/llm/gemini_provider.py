@@ -15,7 +15,11 @@ load_dotenv()
 
 
 class GeminiProvider(LLMProvider):
-    def __init__(self, model: str = "gemini-2.5-flash"):
+    # "gemini-flash-latest" is Google's floating alias to the current
+    # recommended flash model -- pinning an exact version (e.g.
+    # "gemini-2.5-flash") breaks silently once Google deprecates it for
+    # new API keys, which is exactly what happened here.
+    def __init__(self, model: str = "gemini-flash-latest"):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = model
 

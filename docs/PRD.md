@@ -467,3 +467,135 @@ current priority order.
   **Not yet verified in a real browser** -- no way to run `npm install`/`npm run dev` or esbuild in
   this sandbox (no network access); needs a real local check that `react-markdown`/`remark-gfm`
   install cleanly and the rendered output actually looks right before considering this done.
+
+- **[Feature — client-side PDF export of a conversation, first item off the chat feature list]**
+  Per the fuller problem-statement context provided this session (multilingual/Kannalish, voice
+  I/O, local PDF export, XAI citation badges, admin CRUD -- see chat requirements discussion), PDF
+  export was picked to build first: self-contained, no Catalyst-service dependency, no priority
+  ordering blocked on unresolved Catalyst QuickML/Zia access status. New
+  `vetro-ai-frontend/src/lib/exportPdf.js`, wired into `ChatInterface.jsx` as an "Export PDF" button
+  in the chat header (disabled with no messages or mid-stream). Uses `html2pdf.js` (html2canvas +
+  jsPDF) so it renders whatever is actually on screen -- markdown, tables, and any future embedded
+  images/diagrams (e.g. a network graph) -- rather than re-deriving formatting from raw message
+  text, so it stays correct automatically as `MarkdownMessage` evolves. Filename/heading come from
+  the conversation's title, threaded down from `ChatApp.jsx`.
+  **Two real bugs found and fixed by actually running this in a real (Playwright-driven) browser,
+  not just reading the code:**
+  1. The initial implementation cloned the message-log node and moved the clone off-screen (`left:
+     -99999px`) to capture the full conversation instead of just the scrolled-into-view portion.
+     This produced a near-empty 3KB PDF every time -- html2canvas re-clones the whole document into
+     its own iframe to measure/render the target, and an element parked thousands of pixels outside
+     the viewport gets measured with **height 0** in that internal clone (confirmed directly:  my
+     own clone measured a correct non-zero `offsetHeight` right up until the moment html2canvas
+     touched it). Fixed by capturing the **live element in place** instead (temporarily setting
+     `height: auto; overflow: visible` on the actual node, capturing, then restoring), accepting a
+     brief in-place layout expansion during capture rather than fighting html2canvas's off-screen
+     clone-measurement behavior.
+  2. Even after that fix, the exported PDF rendered on a **plain white background** -- illegible,
+     since the UI's light-gray/amber text colors are designed for the dark "incident log" theme.
+     Root cause: the message-log element itself has no explicit background (it only looks dark by
+     inheriting from an ancestor), and html2canvas only renders the captured element's own subtree,
+     not its ancestors. The `html2canvas: { backgroundColor: ... }` config option alone didn't take
+     effect reliably; fixed by setting the background color directly on the element being captured
+     (temporarily, restored afterward) as the deciding fix rather than only relying on that option.
+  Verified end-to-end with a real Playwright-driven Chromium session against a live `uvicorn` +
+  Postgres + real Gemini backend: sent a live chat query, waited for the real streamed response,
+  clicked Export PDF, confirmed a real download event fired, then extracted the embedded image from
+  the resulting PDF (via `pypdf`) and visually confirmed correct dark-theme background, correct
+  text/heading/label colors, and correct content (query + response + export heading) -- not just
+  "the button doesn't crash."
+
+- **[Bug fix — Gemini model deprecated, found while testing PDF export]** Live chat testing (needed
+  to get a real streamed response to export) surfaced `google.genai.errors.ClientError: 404
+  NOT_FOUND` on every `/chat/` call: `models/gemini-2.5-flash` -- the hardcoded default in
+  `infrastructure/llm/gemini_provider.py` -- is no longer available to this API key even though it
+  still appears in `client.models.list()`. Root-caused by listing models actually available for
+  `generateContent` and testing directly against the live API (not guessing a replacement name).
+  Fixed by switching the default to `gemini-flash-latest`, Google's floating alias to the current
+  recommended flash model -- deliberately chosen over pinning another specific dated model name
+  again, since pinning is exactly what caused this breakage once Google deprecated the old one for
+  new keys.
+
+- **[Cleanup — dead code and a stale duplicate project snapshot removed]** Found while reading the
+  repo end-to-end this session, unrelated to any single feature: `db/config/`, `db/domain/`,
+  `db/infrastructure/`, `db/docs/`, `db/ksp-frontend/` were an entire stale, pre-rename copy of the
+  domain/infrastructure layers, this PRD, and the frontend, accidentally nested inside `db/` and
+  tracked in git since the very first commit -- diverging from their real top-level counterparts
+  (e.g. `db/docs/PRD.md` was missing this file's last ~160 lines of history; `db/ksp-frontend/
+  package.json` still said `"name": "ksp-frontend"`). Nothing imported from them; confirmed via
+  grep before deleting. Also removed three more dead files nothing imports anymore, left behind by
+  earlier migration stages that claimed (incorrectly) to have deleted them: `db/repository_base.py`,
+  `db/repository_factory.py`, `db/repository_postgres.py` (superseded by `domain/interfaces/
+  case_repository.py` + `infrastructure/persistence/*`), and `api/strategies/llm_provider.py`
+  (superseded by `domain/interfaces/llm_provider.py` + `infrastructure/llm/*`). Updated `README.md`'s
+  stale references to all of the above (old file paths in the Repository/Factory pattern sections,
+  a "Test frontend" section describing the long-deleted `frontend_test/index.html`) to reflect
+  current reality. Did not touch this file's (`docs/PRD.md`) own historical decision-log entries
+  that reference the old paths -- those describe what was true *at the time*, and rewriting history
+  here would undermine the "trustworthy chronological log" principle stated at the top of this file.
+
+- **[Config] `.env.example` brought in sync with what the code actually reads.** It only listed
+  `GEMINI_API_KEY`, `SUPABASE_*`, and `CORS_ALLOWED_ORIGINS` -- missing `DATABASE_URL`,
+  `DATA_BACKEND`, `LLM_BACKEND`, and `CACHE_BACKEND`, all of which are real `os.getenv()` reads
+  (`db/connection.py`, `infrastructure/persistence/repository_factory.py`, `infrastructure/llm/
+  llm_factory.py`, `infrastructure/cache/conversation_memory_factory.py`) that were previously
+  undocumented anywhere a new clone of this repo would see them. Added with comments noting their
+  defaults, so a fresh `.env` built from the example still boots correctly without them explicitly
+  set.
+
+- **[Feature — PDF export rebuilt as real text, not a screenshot]** User tested the html2canvas
+  version from the previous entry and asked directly: "is this a picture?" -- yes, and on
+  reflection a genuine defect for this use case, not just a style question: an investigator
+  exporting a conversation as an evidence/reference record wants selectable, searchable, copyable
+  text, not a raster image, and any future clickable citation badge (`[Source: FIR #412/2025]`)
+  needs to stay a *real* link, which a screenshot can never provide. Rebuilt
+  `exportPdf.js` around `jsPDF` directly (dropped `html2pdf.js`/`html2canvas` as dependencies
+  entirely) plus `unified`/`remark-parse`/`remark-gfm` to parse each assistant message's markdown
+  into an AST and walk it into properly laid-out PDF text -- headings, bold/italic, ordered/
+  unordered lists, blockquotes (with a rendered accent bar), fenced code blocks (monospace +
+  background), GFM tables, and real clickable links, all via a hand-rolled word-wrap-with-mixed-
+  styles renderer (jsPDF has no native rich-text wrapping). Reads straight from the `messages`
+  array already held in `ChatInterface` state rather than the rendered DOM at all -- this also
+  fully sidesteps the html2canvas off-screen-measurement bug from the previous entry, since there's
+  no DOM capture step anymore. Switched the color palette from the on-screen dark theme to a
+  printable white-background/dark-text one (screen colors were tuned for a dark background and
+  would be low-contrast on white paper). jsPDF and the markdown-parsing libs are dynamically
+  imported inside `exportConversationToPdf()` (not static top-level imports) so they stay out of
+  the initial page bundle, matching the lazy-loading discipline the original html2canvas version
+  already had -- confirmed via a production build that only `jspdf`'s chunk is pulled in on click,
+  `unified`/`remark-parse`/`remark-gfm` are already eagerly bundled anyway via `MarkdownMessage.jsx`
+  so those specific dynamic imports don't achieve further splitting (harmless, not a regression).
+  **Two more real bugs found by directly testing the actual rendering primitives, not just reading
+  the code:** (1) the unordered-list bullet character (`•`, U+2022) came out as a mangled
+  replacement glyph under text extraction -- jsPDF's default core fonts only support WinAnsi
+  encoding; switched to a plain `-`. (2) the document title (built from the conversation's
+  auto-generated title, which can be long) was being drawn unwrapped and ran off the page edge;
+  fixed with `doc.splitTextToSize()`. Verified directly and independently of any PDF-rendering
+  tool's own quirks: (a) called `jsPDF.splitTextToSize()` with the exact title string in isolation
+  and confirmed it now returns two full, correctly-broken lines, not one truncated line; (b)
+  extracted the real text layer of a freshly re-generated export via `pypdf` and confirmed the
+  body content -- headings, a numbered top-5 list, district names and counts -- came back exactly
+  right and in order. (One caveat surfaced and deliberately not chased further: `pypdf`'s own
+  text-extraction heuristic still garbles the *wrapped title line specifically* in its reconstructed
+  output, despite the line being provably correct at the rendering-call level per (a) above -- a
+  known limitation of that extraction heuristic around line-wrap boundaries, not a defect in the
+  generated PDF; real PDF viewers render it correctly.) Full round-trip (live chat query -> live
+  Gemini response -> Export PDF -> real download -> text extraction) re-verified end-to-end via a
+  Playwright-driven Chromium session against the running app, same as the previous entry.
+
+- **[Bug fix — Critical, `.gitignore` was silently untracking `vetro-ai-frontend/src/lib/` entirely]**
+  Found while double-checking that this session's new `exportPdf.js` would actually get committed:
+  `git status` showed it as untracked, expected for a new file -- but so was the *existing*
+  `ownerToken.js`, which should never have shown up as untracked at all. Root cause: `.gitignore`'s
+  standard Python boilerplate section uses unanchored patterns (`build/`, `dist/`, `lib/`, `lib64/`
+  -- no leading `/`), which git matches at *any* depth, not just the repo root. `lib/` was silently
+  matching `vetro-ai-frontend/src/lib/` too. Practical impact: **`ownerToken.js` -- the file
+  implementing the owner-token conversation-auth stopgap from the earlier security review entry --
+  was never actually tracked in git**, on any commit since it was written; anyone cloning this repo
+  fresh would get a build that imports a file that doesn't exist. Fixed by anchoring the four
+  colliding patterns to the repo root (`/build/`, `/dist/`, `/lib/`, `/lib64/`), preserving their
+  original intent (ignore Python packaging artifacts at the root) without catching same-named
+  directories elsewhere in the tree. `vetro-ai-frontend/src/lib/ownerToken.js` and the new
+  `exportPdf.js` both now show up correctly as addable. **Worth a repo-wide double check next time
+  there's a "why is this file missing after clone" surprise** -- this class of bug (silently-ignored
+  file, no error, no warning) is exactly the kind that survives unnoticed across many commits.

@@ -74,17 +74,17 @@ print(results["documents"])
 
 ## Repository pattern: Postgres vs Catalyst
 
-All database access goes through the `CaseRepository` interface (`db/repository_base.py`), never directly through SQLAlchemy or the Catalyst SDK in application code. Two implementations exist:
+All database access goes through the `CaseRepository` interface (`domain/interfaces/case_repository.py`), never directly through SQLAlchemy or the Catalyst SDK in application code. Two implementations exist:
 
-- `db/repository_postgres.py` — Postgres/Supabase, via SQLAlchemy. **Fully tested against real seeded data.**
-- `catalyst/repository_catalyst.py` — Catalyst Data Store, via ZCQL + `zcatalyst_sdk`. **Written against Catalyst's documented SDK interface but NOT yet tested against a real Catalyst project** (no network/credentials access from the environment this was built in). Treat as a strong first draft — run it against your actual Catalyst project and report errors.
+- `infrastructure/persistence/postgres_repository.py` — Postgres/Supabase, via SQLAlchemy. **Fully tested against real seeded data.**
+- `infrastructure/persistence/catalyst_repository.py` — Catalyst Data Store, via ZCQL + `zcatalyst_sdk`. **Written against Catalyst's documented SDK interface but NOT yet tested against a real Catalyst project** (no network/credentials access from the environment this was built in). Treat as a strong first draft — run it against your actual Catalyst project and report errors.
 
 Switch between them via `.env`:
 ```
 DATA_BACKEND=postgres   # local/Supabase dev
 DATA_BACKEND=catalyst   # once Catalyst Data Store tables exist
 ```
-Routes/services call `db.repository_factory.get_case_repository()` and never need to know which backend is active.
+Routes/services call `infrastructure.persistence.repository_factory.get_case_repository()` and never need to know which backend is active.
 
 ### Before using the Catalyst backend
 
@@ -122,7 +122,7 @@ The pipeline is built so this is a data-source swap, not a rewrite:
 
 # Stage 2: FastAPI Backend
 
-Sits on top of Stage 1 -- imports `db.repository_factory.get_case_repository()`
+Sits on top of Stage 1 -- imports `infrastructure.persistence.repository_factory.get_case_repository()`
 and nothing from Stage 1 was modified to build this. Run it with:
 
 ```bash
@@ -133,9 +133,9 @@ Visit `http://localhost:8000/docs` for the interactive API tester (auto-generate
 
 ## Architecture / design patterns used
 
-- **Repository pattern** (`db/repository_base.py` + `repository_postgres.py` / `catalyst/repository_catalyst.py`) --
+- **Repository pattern** (`domain/interfaces/case_repository.py` + `infrastructure/persistence/{postgres_repository,catalyst_repository}.py`) --
   routes never touch SQLAlchemy or ZCQL directly.
-- **Factory pattern** (`db/repository_factory.py`, `api/strategies/llm_provider.py`) --
+- **Factory pattern** (`infrastructure/persistence/repository_factory.py`, `infrastructure/llm/llm_factory.py`) --
   picks Postgres vs Catalyst, and Gemini vs (future) Catalyst QuickML, based on env vars.
 - **Strategy pattern** (`api/strategies/query_strategy.py`) -- routes chatbot
   questions to either SQL aggregation or ChromaDB semantic search, based on
@@ -170,11 +170,18 @@ Chat is the one fully built out with the Strategy/Service layers.
 **Not yet tested:**
 - Semantic search strategy's live Gemini-embedding + ChromaDB query path (same network restriction as above; the *mechanism* was verified against a local test collection using precomputed embeddings, which is the correct pattern -- but not against your real `fir_cases` collection with real Gemini embeddings)
 - The full chatbot response quality/tone (depends on real Gemini output)
-- Frontend (`frontend_test/index.html`) against a live backend -- the fetch/streaming-read JS logic mirrors the exact pattern from our very first "fake stream" demo early in this project, which you can test directly by opening the HTML file in a browser once `uvicorn` is running locally.
 
-## Test frontend
+## Frontend
 
-`frontend_test/index.html` is a throwaway single-file test page (not the real React frontend) -- open it directly in a browser, point it at your running `uvicorn` instance, and confirm tokens stream in as they arrive. This is purely to validate the backend/streaming contract before building the real chat UI in React.
+`vetro-ai-frontend/` is the real React (Vite) chat UI -- multi-session "Investigation" sidebar, streaming Markdown-rendered responses, and client-side PDF export of a conversation. Run it with:
+
+```bash
+cd vetro-ai-frontend
+npm install
+npm run dev
+```
+
+Then open `http://localhost:5173` with the backend (`uvicorn api.main:app --reload`) running.
 
 ## Known bug found and fixed during testing
 
@@ -190,5 +197,4 @@ the code against a test ChromaDB collection, not just reading it.
 
 1. Test `/chat/` with a real `GEMINI_API_KEY` locally, confirm both strategies produce sensible answers.
 2. Build out `/analytics`, `/map`, `/graph` further if the demo needs pagination, caching (Catalyst Cache is a good fit here), or map clustering.
-3. Replace `frontend_test/index.html` with the real React chat UI once streaming is confirmed working with real Gemini output.
-4. Resolve the Catalyst QuickML question -- `api/strategies/llm_provider.py` already has a `CatalystQuickMLProvider` placeholder ready to implement once that's answered.
+3. Resolve the Catalyst QuickML question -- `infrastructure/llm/catalyst_quickml_provider.py` already has a `CatalystQuickMLProvider` placeholder ready to implement once that's answered.

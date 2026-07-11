@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Loader2 } from "lucide-react";
+import { Send, Loader2, FileDown } from "lucide-react";
 import { AUTH_HEADERS } from "../lib/ownerToken";
+import { exportConversationToPdf } from "../lib/exportPdf";
 import MarkdownMessage from "./MarkdownMessage";
 
 /**
@@ -31,11 +32,12 @@ function formatTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export default function ChatInterface({ conversationId, onMessageSent }) {
+export default function ChatInterface({ conversationId, conversationTitle, onMessageSent }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const scrollRef = useAutoScroll(messages);
 
   // Reload this conversation's persisted history whenever the active
@@ -143,6 +145,18 @@ export default function ChatInterface({ conversationId, onMessageSent }) {
     }
   }
 
+  async function handleExportPdf() {
+    if (isExporting || messages.length === 0) return;
+    setIsExporting(true);
+    try {
+      await exportConversationToPdf(messages, conversationTitle);
+    } catch (err) {
+      console.error("PDF export failed:", err);
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-screen bg-[#0B1120] text-[#E4E7EC] flex-1 min-w-0">
       {/* Header */}
@@ -153,9 +167,26 @@ export default function ChatInterface({ conversationId, onMessageSent }) {
           </h1>
           <p className="text-xs text-[#6B7488] mt-0.5">Karnataka SCRB &middot; Query Interface</p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-[#6B7488] font-mono">
-          <span className={`w-1.5 h-1.5 rounded-full ${isStreaming ? "bg-[#D4A24C] animate-pulse" : "bg-[#3A6B4C]"}`} />
-          {isStreaming ? "RETRIEVING" : "READY"}
+        <div className="flex items-center gap-4">
+          <button
+            onClick={handleExportPdf}
+            disabled={isExporting || isStreaming || messages.length === 0}
+            title="Export conversation as PDF"
+            className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider
+                       text-[#6B7488] hover:text-[#D4A24C] disabled:opacity-30
+                       disabled:cursor-not-allowed disabled:hover:text-[#6B7488] transition-colors"
+          >
+            {isExporting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <FileDown className="w-3.5 h-3.5" />
+            )}
+            Export PDF
+          </button>
+          <div className="flex items-center gap-2 text-xs text-[#6B7488] font-mono">
+            <span className={`w-1.5 h-1.5 rounded-full ${isStreaming ? "bg-[#D4A24C] animate-pulse" : "bg-[#3A6B4C]"}`} />
+            {isStreaming ? "RETRIEVING" : "READY"}
+          </div>
         </div>
       </div>
 
