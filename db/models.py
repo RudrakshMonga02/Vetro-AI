@@ -374,5 +374,10 @@ class Message(Base):
     role = Column(String, nullable=False)  # "user" | "assistant"
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, nullable=False)
+    # JSON-serialized list[dict] from SemanticSearchStrategy, or NULL for
+    # SQL/entity-list answers (which never produce citations) and for
+    # every message persisted before this column existed. Only ever
+    # written for "assistant" rows.
+    citations = Column(Text, nullable=True)
 
     conversation = relationship("Conversation", back_populates="messages")

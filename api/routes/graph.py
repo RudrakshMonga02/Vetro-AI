@@ -19,3 +19,12 @@ def case_network(case_id: int):
     if not result["nodes"]:
         raise HTTPException(status_code=404, detail="Case not found or has no linked records")
     return result
+
+
+@router.get("/case/{case_id}/timeline")
+def case_timeline(case_id: int):
+    repo = get_case_repository()
+    events = repo.get_case_timeline(case_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="Case not found or has no dated events")
+    return events

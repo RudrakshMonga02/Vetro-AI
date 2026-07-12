@@ -12,6 +12,6 @@ router = APIRouter()
 
 
 @router.get("/hotspots")
-def hotspot_data(limit: int = 5000):
+def hotspot_data(limit: int = 5000, crime_type: str | None = None):
     repo = get_case_repository()
-    return repo.get_cases_for_map(limit=limit)
+    return repo.get_cases_for_map(limit=limit, crime_type=crime_type)

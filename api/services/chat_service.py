@@ -23,6 +23,7 @@ its source of truth. The two abstractions happen to share the same
 history shape ([{'role', 'text'}, ...]) on purpose, so query_rewriter.py
 needed zero changes despite the swap underneath it.
 """
+import json
 from typing import AsyncIterator
 
 from api.strategies.query_classifier import classify_query_llm
@@ -37,6 +38,31 @@ from infrastructure.persistence.repository_factory import get_case_repository
 # can hold the full history indefinitely; this just caps how much of
 # it gets spent on prompt tokens for any single turn.
 TURNS_FED_TO_PROMPT = 6
+
+# Marker separating the streamed answer text from a trailing JSON
+# citations payload, when the active strategy produced any (only
+# SemanticSearchStrategy does -- see query_strategy.py). Chosen over
+# SSE/typed events or a response header: SQLQueryStrategy/
+# EntityListStrategy answers never contain this marker, so the
+# existing frontend's plain accumulate-and-render loop needs exactly
+# one extra step (split on this marker after the stream ends) instead
+# of a full rewrite to a framed streaming protocol. See docs/PRD.md
+# for the fuller reasoning on this choice.
+CITATION_SENTINEL = "\n\n<<<VETRO_CITATIONS>>>\n"
+
+# Same transport approach as citations, appended after them (if present)
+# so the frontend always splits in a fixed, predictable order:
+# answer text -> citations block (optional) -> follow-ups block (optional).
+FOLLOWUP_SENTINEL = "\n\n<<<VETRO_FOLLOWUPS>>>\n"
+
+_FOLLOWUP_PROMPT_TEMPLATE = """Given this question and answer from a crime-data chatbot, \
+suggest 2-3 short, natural follow-up questions an investigator might ask next. Respond with \
+ONLY the questions, one per line, nothing else -- no numbering, no preamble. Match the \
+language of the original question (English, Kannada, or Kannalish).
+
+Question: {question}
+
+Answer: {answer}"""
 
 
 class ChatService:
@@ -67,7 +93,7 @@ class ChatService:
         # ORIGINAL user_query is still what goes in the final prompt
         # below, so the model responds in whatever language was asked.
         strategy, english_query = await classify_query_llm(retrieval_query, self.llm)
-        context = strategy.build_context(english_query, self.repo)
+        context, citations = strategy.build_context(english_query, self.repo)
 
         history_block = self._format_history(history)
 
@@ -108,6 +134,19 @@ Answer:"""
             answer_chunks.append(chunk)
             yield chunk
 
+        # Citations, if the strategy produced any, are appended AFTER
+        # the natural end of the answer text -- and now also persisted
+        # alongside the assistant message below, so reopening an old
+        # conversation shows the same citation badges a live answer did.
+        full_answer = "".join(answer_chunks)
+
+        if citations:
+            yield CITATION_SENTINEL + json.dumps(citations)
+
+        followups = await self._suggest_followups(user_query, full_answer)
+        if followups:
+            yield FOLLOWUP_SENTINEL + json.dumps(followups)
+
         # Persist this turn AFTER the full answer has streamed, so a
         # request that errors partway through doesn't leave a
         # half-written assistant turn poisoning future context.
@@ -118,9 +157,22 @@ Answer:"""
         # append_message() for the "user" role also auto-titles the
         # conversation from this text if it's still untitled -- see
         # postgres_conversation_repository.py.
-        full_answer = "".join(answer_chunks)
         self.conversations.append_message(conversation_id, "user", user_query)
-        self.conversations.append_message(conversation_id, "assistant", full_answer)
+        self.conversations.append_message(conversation_id, "assistant", full_answer, citations=citations)
+
+    async def _suggest_followups(self, question: str, answer: str) -> list[str]:
+        """One extra LLM call after the main answer streams -- degrades
+        to no suggestions (never raises) on any failure, same pattern as
+        query_rewriter.py/query_classifier.py. This must never take down
+        an otherwise-successful turn."""
+        try:
+            raw = await self.llm.generate(
+                _FOLLOWUP_PROMPT_TEMPLATE.format(question=question, answer=answer)
+            )
+            lines = [line.strip("-• \t") for line in raw.splitlines()]
+            return [line for line in lines if line][:3]
+        except Exception:
+            return []
 
     @staticmethod
     def _format_history(history: list[dict[str, str]]) -> str:

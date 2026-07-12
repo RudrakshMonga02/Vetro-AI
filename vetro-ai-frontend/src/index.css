@@ -1,3 +1,42 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Leaflet's Popup renders with the library's own light-theme default
+   (white background, dark text) regardless of page theme -- react-leaflet's
+   Popup className prop only adds a class, it doesn't override Leaflet's own
+   built-in styles, so these rules target Leaflet's own class names directly. */
+.vetro-popup .leaflet-popup-content-wrapper {
+  background: #151b2e;
+  color: #c8ccd8;
+  border: 1px solid #2a3348;
+  border-radius: 4px;
+}
+.vetro-popup .leaflet-popup-tip {
+  background: #151b2e;
+  border: 1px solid #2a3348;
+}
+.vetro-popup .leaflet-popup-close-button {
+  color: #6b7488;
+}
+.vetro-popup .leaflet-popup-close-button:hover {
+  color: #d4a24c;
+}
+
+/* react-leaflet-cluster's default cluster icons are green/yellow/orange,
+   designed for a light basemap -- override to the app's amber palette
+   (varying opacity for small/medium/large, same visual language as
+   everything else) with light text for contrast against the dark map. */
+.marker-cluster-small,
+.marker-cluster-medium,
+.marker-cluster-large {
+  background-color: rgba(214, 138, 60, 0.35);
+}
+.marker-cluster-small div,
+.marker-cluster-medium div,
+.marker-cluster-large div {
+  background-color: rgba(214, 138, 60, 0.75);
+  color: #14120f;
+  font-weight: 600;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}

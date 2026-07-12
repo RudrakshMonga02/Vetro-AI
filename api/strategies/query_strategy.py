@@ -15,6 +15,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any
 
+from api.services.response_cache import cached_or_compute
 from domain.interfaces.case_repository import CaseRepository
 
 AGGREGATE_KEYWORDS = [
@@ -36,20 +37,35 @@ ENTITY_LIST_KEYWORDS = [
 
 class QueryStrategy(ABC):
     @abstractmethod
-    def build_context(self, query: str, repo: CaseRepository) -> str:
-        """Return a text context block to feed into the LLM prompt."""
+    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
+        """Return (context_text, citations). context_text feeds into the
+        LLM prompt as before. citations is None for strategies with no
+        discrete, document-level sources -- SQL aggregates and entity
+        lists aren't "citable documents" in the same sense a specific
+        case record is. Only SemanticSearchStrategy returns a real
+        citations list, built from ChromaDB's ids/metadatas."""
         ...
 
 
 class SQLQueryStrategy(QueryStrategy):
     """For aggregate/statistical questions -- pulls structured summaries
-    from the repository rather than individual case text."""
+    from the repository rather than individual case text.
 
-    def build_context(self, query: str, repo: CaseRepository) -> str:
-        total = repo.get_total_case_count()
-        district_counts = repo.get_district_counts()
-        crime_counts = repo.get_crime_type_counts()
-        trend = repo.get_monthly_trend()
+    Routed through the same response cache the /analytics/* routes use
+    (api/services/response_cache.py), and deliberately with the SAME
+    cache keys those routes use for the equivalent unfiltered query --
+    so a chat question and a Trends-tab page load share one cache entry
+    instead of each maintaining a redundant copy of the same data. This
+    was previously the slowest part of an aggregate chat answer: these
+    four calls hit Postgres/Supabase directly, uncached, every single
+    turn -- a "how many cases" question was paying the same ~9-10s
+    round-trip the districts query was measured at before caching."""
+
+    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
+        total = cached_or_compute("analytics:total_count", lambda: repo.get_total_case_count())
+        district_counts = cached_or_compute("analytics:districts", lambda: repo.get_district_counts())
+        crime_counts = cached_or_compute("analytics:crime_types:all", lambda: repo.get_crime_type_counts())
+        trend = cached_or_compute("analytics:trend:all:all", lambda: repo.get_monthly_trend())
 
         # Exact total, from a real COUNT query -- NOT derived by having
         # the LLM sum the (possibly truncated) breakdown below. This was
@@ -74,7 +90,7 @@ class SQLQueryStrategy(QueryStrategy):
         for row in trend[-12:]:
             lines.append(f"  {row['month']}: {row['count']}")
 
-        return "\n".join(lines)
+        return "\n".join(lines), None
 
 
 class EntityListStrategy(QueryStrategy):
@@ -86,10 +102,10 @@ class EntityListStrategy(QueryStrategy):
     def __init__(self, limit: int = 50):
         self.limit = limit
 
-    def build_context(self, query: str, repo: CaseRepository) -> str:
+    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
         accused = repo.get_accused_list(limit=self.limit)
         if not accused:
-            return "No accused records found."
+            return "No accused records found.", None
 
         lines = [f"Accused persons on record (showing up to {self.limit}):"]
         for a in accused:
@@ -97,7 +113,7 @@ class EntityListStrategy(QueryStrategy):
                 f"  {a['accused_name']} (age {a['age']}, gender {a['gender']}) — "
                 f"FIR {a['crime_no']}, {a['crime_type']}, status: {a['case_status']}"
             )
-        return "\n".join(lines)
+        return "\n".join(lines), None
 
 
 class SemanticSearchStrategy(QueryStrategy):
@@ -114,7 +130,7 @@ class SemanticSearchStrategy(QueryStrategy):
     def __init__(self, top_k: int = 5):
         self.top_k = top_k
 
-    def build_context(self, query: str, repo: CaseRepository) -> str:
+    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
         import os
         import chromadb
         from google import genai
@@ -128,13 +144,33 @@ class SemanticSearchStrategy(QueryStrategy):
         chroma_client = chromadb.PersistentClient(path="./chroma_store")
         collection = chroma_client.get_or_create_collection(name="fir_cases")
 
-        results = collection.query(query_embeddings=[query_embedding], n_results=self.top_k)
+        results = collection.query(
+            query_embeddings=[query_embedding], n_results=self.top_k,
+            include=["documents", "metadatas"],  # ids come back by default
+        )
+        ids = results.get("ids", [[]])[0]
         docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
 
         if not docs:
-            return "No matching case records found."
+            return "No matching case records found.", None
 
-        return "Relevant case records:\n" + "\n---\n".join(docs)
+        # Citations are for explainability -- surfacing which specific
+        # case records the answer is grounded in, per the "explainable
+        # AI / transparent analytics" requirement. rag/embed.py's
+        # metadata has no crime_no (only district/crime_type/date/
+        # status), so case_id (== CaseMasterID) is the identifier the
+        # frontend links against, not a human FIR number.
+        citations = [
+            {
+                "case_id": id_, "district": m.get("district"),
+                "crime_type": m.get("crime_type"), "date": m.get("date"),
+                "status": m.get("status"),
+            }
+            for id_, m in zip(ids, metas)
+        ]
+
+        return "Relevant case records:\n" + "\n---\n".join(docs), citations
 
 
 def classify_query(query: str) -> QueryStrategy:

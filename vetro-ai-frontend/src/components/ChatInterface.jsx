@@ -1,8 +1,17 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Loader2, FileDown } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Send, Loader2, FileDown, Mic, MicOff, Volume2, VolumeX } from "lucide-react";
 import { AUTH_HEADERS } from "../lib/ownerToken";
+import { API_BASE } from "../lib/apiClient";
 import { exportConversationToPdf } from "../lib/exportPdf";
 import MarkdownMessage from "./MarkdownMessage";
+import {
+  isSpeechRecognitionSupported,
+  isSpeechSynthesisSupported,
+  createRecognizer,
+  speak,
+  stopSpeaking,
+} from "../lib/speechRecognition";
 
 /**
  * ChatInterface -- the message thread for ONE conversation.
@@ -18,7 +27,16 @@ import MarkdownMessage from "./MarkdownMessage";
  * this is an analyst tool for crime data, not a consumer messaging app.
  */
 
-const API_BASE = "http://localhost:8000";
+// Markers separating streamed answer text from trailing JSON payloads --
+// must match api/services/chat_service.py's CITATION_SENTINEL /
+// FOLLOWUP_SENTINEL exactly. Only ever present on answers that produced
+// them (citations: SemanticSearchStrategy only; followups: whenever the
+// suggestion call succeeds) -- SQL/entity-list answers never contain
+// either, so this split is a no-op for those.
+const CITATION_SENTINEL = "\n\n<<<VETRO_CITATIONS>>>\n";
+const FOLLOWUP_SENTINEL = "\n\n<<<VETRO_FOLLOWUPS>>>\n";
+
+const VOICE_LANGS = { en: "en-IN", kn: "kn-IN" };
 
 function useAutoScroll(dep) {
   const ref = useRef(null);
@@ -32,13 +50,52 @@ function formatTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/** Strips both trailing metadata blocks off a raw accumulated stream,
+ * in whichever combination is present. Followups (if any) always come
+ * last, so peel from the end first. */
+function splitMetadata(accumulated) {
+  let displayText = accumulated;
+  let citations = null;
+  let followups = null;
+
+  const followupIdx = displayText.indexOf(FOLLOWUP_SENTINEL);
+  if (followupIdx !== -1) {
+    try {
+      followups = JSON.parse(displayText.slice(followupIdx + FOLLOWUP_SENTINEL.length));
+    } catch {
+      followups = null;
+    }
+    displayText = displayText.slice(0, followupIdx);
+  }
+
+  const citationIdx = displayText.indexOf(CITATION_SENTINEL);
+  if (citationIdx !== -1) {
+    try {
+      citations = JSON.parse(displayText.slice(citationIdx + CITATION_SENTINEL.length));
+    } catch {
+      citations = null;
+    }
+    displayText = displayText.slice(0, citationIdx);
+  }
+
+  return { displayText, citations, followups };
+}
+
 export default function ChatInterface({ conversationId, conversationTitle, onMessageSent }) {
+  const navigate = useNavigate();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [speakingIndex, setSpeakingIndex] = useState(null);
+  const [voiceLang, setVoiceLang] = useState("en");
   const scrollRef = useAutoScroll(messages);
+  const recognizerRef = useRef(null);
+
+  const micSupported = isSpeechRecognitionSupported();
+  const speakerSupported = isSpeechSynthesisSupported();
 
   // Reload this conversation's persisted history whenever the active
   // conversation changes (sidebar switch) -- this is what makes each
@@ -64,6 +121,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
           history.map((m) => ({
             role: m.role === "user" ? "query" : "response",
             text: m.text,
+            citations: m.citations ?? null,
             time: formatTime(),
           }))
         );
@@ -83,12 +141,22 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
     };
   }, [conversationId]);
 
-  async function handleSend() {
-    const query = input.trim();
+  // Stop any in-flight recognition/speech when switching conversations,
+  // so a lingering mic session or read-aloud doesn't bleed across
+  // "Investigation" threads.
+  useEffect(() => {
+    return () => {
+      recognizerRef.current?.stop();
+      stopSpeaking();
+    };
+  }, [conversationId]);
+
+  async function handleSend(overrideQuery) {
+    const query = (overrideQuery ?? input).trim();
     if (!query || isStreaming || !conversationId) return;
 
     const userMsg = { role: "query", text: query, time: formatTime() };
-    const assistantMsg = { role: "response", text: "", time: formatTime() };
+    const assistantMsg = { role: "response", text: "", citations: null, followups: null, time: formatTime() };
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setInput("");
     setIsStreaming(true);
@@ -112,12 +180,24 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
         const { done, value } = await reader.read();
         if (done) break;
         accumulated += decoder.decode(value, { stream: true });
+        // Live-typing update during the stream -- both metadata
+        // sentinels (if any) only ever appear after the real answer
+        // text, so showing the raw accumulated string mid-stream looks
+        // identical to today until the very last chunks arrive. The
+        // final split happens once, after done, below.
         setMessages((prev) => {
           const next = [...prev];
           next[next.length - 1] = { ...next[next.length - 1], text: accumulated };
           return next;
         });
       }
+
+      const { displayText, citations, followups } = splitMetadata(accumulated);
+      setMessages((prev) => {
+        const next = [...prev];
+        next[next.length - 1] = { ...next[next.length - 1], text: displayText, citations, followups };
+        return next;
+      });
 
       // Let the parent know a message completed -- this is what
       // triggers the sidebar to refresh (picks up auto-generated
@@ -157,8 +237,42 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
     }
   }
 
+  function toggleListening() {
+    if (!micSupported) return;
+    if (isListening) {
+      recognizerRef.current?.stop();
+      return;
+    }
+    const recognizer = createRecognizer({
+      lang: VOICE_LANGS[voiceLang],
+      onResult: (transcript) => setInput((prev) => (prev ? `${prev} ${transcript}` : transcript)),
+      onEnd: () => setIsListening(false),
+      onError: () => setIsListening(false),
+    });
+    recognizerRef.current = recognizer;
+    setIsListening(true);
+    recognizer.start();
+  }
+
+  function toggleSpeak(index, text) {
+    if (!speakerSupported) return;
+    if (speakingIndex === index) {
+      stopSpeaking();
+      setSpeakingIndex(null);
+      return;
+    }
+    speak(text, VOICE_LANGS[voiceLang]);
+    setSpeakingIndex(index);
+    const check = setInterval(() => {
+      if (!window.speechSynthesis.speaking) {
+        setSpeakingIndex(null);
+        clearInterval(check);
+      }
+    }, 300);
+  }
+
   return (
-    <div className="flex flex-col h-screen bg-[#0B1120] text-[#E4E7EC] flex-1 min-w-0">
+    <div className="flex flex-col h-full bg-[#0B1120] text-[#E4E7EC] flex-1 min-w-0">
       {/* Header */}
       <div className="border-b border-[#2A3348] px-6 py-4 flex items-center justify-between shrink-0">
         <div>
@@ -168,6 +282,16 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
           <p className="text-xs text-[#6B7488] mt-0.5">Karnataka SCRB &middot; Query Interface</p>
         </div>
         <div className="flex items-center gap-4">
+          {(micSupported || speakerSupported) && (
+            <button
+              onClick={() => setVoiceLang((l) => (l === "en" ? "kn" : "en"))}
+              title="Voice language"
+              className="text-xs font-mono uppercase tracking-wider text-[#6B7488] hover:text-[#D4A24C]
+                         border border-[#2A3348] rounded px-2 py-1 transition-colors"
+            >
+              {voiceLang === "en" ? "EN" : "ಕನ್ನಡ"}
+            </button>
+          )}
           <button
             onClick={handleExportPdf}
             disabled={isExporting || isStreaming || messages.length === 0}
@@ -210,7 +334,9 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
           </div>
         )}
 
-        {!isLoadingHistory && messages.map((msg, i) => (
+        {!isLoadingHistory && messages.map((msg, i) => {
+          const isLastMessage = i === messages.length - 1;
+          return (
           <div key={i} className="max-w-3xl mx-auto">
             {msg.role === "query" ? (
               <div className="flex items-start gap-3">
@@ -224,11 +350,58 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
               <div className="flex items-start gap-3 mt-2">
                 <span className="font-mono text-[10px] text-[#6B7488] mt-1.5 shrink-0 w-14">{msg.time}</span>
                 <div className={`flex-1 border-l-2 pl-3 ${msg.error ? "border-[#B0503C]" : "border-[#3A6B4C]"}`}>
-                  <span className={`font-mono text-[10px] uppercase tracking-wider ${msg.error ? "text-[#B0503C]" : "text-[#3A6B4C]"}`}>
-                    {msg.error ? "Error" : "Result"}
-                  </span>
+                  <div className="flex items-center justify-between">
+                    <span className={`font-mono text-[10px] uppercase tracking-wider ${msg.error ? "text-[#B0503C]" : "text-[#3A6B4C]"}`}>
+                      {msg.error ? "Error" : "Result"}
+                    </span>
+                    {speakerSupported && msg.text && !isStreaming && (
+                      <button
+                        onClick={() => toggleSpeak(i, msg.text)}
+                        title="Read answer aloud"
+                        className="text-[#4A5268] hover:text-[#D4A24C] transition-colors"
+                      >
+                        {speakingIndex === i ? (
+                          <VolumeX className="w-3.5 h-3.5" />
+                        ) : (
+                          <Volume2 className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
+                  </div>
                   {msg.text ? (
-                    <MarkdownMessage text={msg.text} />
+                    <>
+                      <MarkdownMessage text={msg.text} />
+                      {msg.citations && msg.citations.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 mt-2">
+                          {msg.citations.map((c) => (
+                            <button
+                              key={c.case_id}
+                              onClick={() => navigate(`/network?case=${c.case_id}`)}
+                              title={`${c.district ?? "?"} · ${c.crime_type ?? "?"} · ${c.date ?? "?"} · ${c.status ?? "?"} — open in Network Graph`}
+                              className="text-[10px] font-mono uppercase tracking-wide text-[#8B93A8]
+                                         border border-[#2A3348] rounded px-1.5 py-0.5
+                                         hover:border-[#D4A24C] hover:text-[#D4A24C] transition-colors"
+                            >
+                              Case #{c.case_id}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {isLastMessage && msg.followups && msg.followups.length > 0 && !isStreaming && (
+                        <div className="flex flex-wrap gap-1.5 mt-3">
+                          {msg.followups.map((q, fi) => (
+                            <button
+                              key={fi}
+                              onClick={() => handleSend(q)}
+                              className="text-xs text-left text-[#A8AEC0] border border-[#2A3348] rounded-full
+                                         px-3 py-1.5 hover:border-[#D4A24C] hover:text-[#D4A24C] transition-colors"
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   ) : (
                     <p className="text-[#C8CCD8] mt-1 leading-relaxed">
                       <span className="inline-flex items-center gap-1.5 text-[#6B7488]">
@@ -240,12 +413,25 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
               </div>
             )}
           </div>
-        ))}
+        );})}
       </div>
 
       {/* Input */}
       <div className="border-t border-[#2A3348] px-6 py-4 shrink-0">
         <div className="max-w-3xl mx-auto flex items-end gap-3">
+          {micSupported && (
+            <button
+              onClick={toggleListening}
+              disabled={!conversationId}
+              title={isListening ? "Stop listening" : "Speak your query"}
+              className={`rounded px-3 py-3 border transition-colors shrink-0 disabled:opacity-30
+                ${isListening
+                  ? "bg-[#B0503C] border-[#B0503C] text-[#0B1120] animate-pulse"
+                  : "bg-[#151B2E] border-[#2A3348] text-[#6B7488] hover:text-[#D4A24C] hover:border-[#D4A24C]"}`}
+            >
+              {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+            </button>
+          )}
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -258,7 +444,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
                        resize-none font-mono disabled:opacity-50"
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={isStreaming || !input.trim() || !conversationId}
             className="bg-[#D4A24C] text-[#0B1120] rounded px-4 py-3 disabled:opacity-30
                        disabled:cursor-not-allowed hover:bg-[#E0B15F] transition-colors shrink-0"

@@ -59,15 +59,23 @@ class ConversationRepository(ABC):
         ...
 
     @abstractmethod
-    def get_messages(self, conversation_id: int, owner_token: str) -> list[dict[str, str]]:
-        """Return [{'role': 'user'|'assistant', 'text': str}, ...] for
-        this conversation, oldest first. Empty list if the conversation
-        has no messages, doesn't exist, or owner_token doesn't match."""
+    def get_messages(self, conversation_id: int, owner_token: str) -> list[dict[str, Any]]:
+        """Return [{'role': 'user'|'assistant', 'text': str,
+        'citations': list[dict] | None}, ...] for this conversation,
+        oldest first. citations is None for every user message and for
+        assistant messages that never had any (SQL/entity-list answers,
+        or anything persisted before the citations column existed).
+        Empty list if the conversation has no messages, doesn't exist,
+        or owner_token doesn't match."""
         ...
 
     @abstractmethod
-    def append_message(self, conversation_id: int, role: str, content: str) -> None:
+    def append_message(
+        self, conversation_id: int, role: str, content: str, citations: list[dict[str, Any]] | None = None
+    ) -> None:
         """Add one message to the conversation and bump updated_at.
+        citations is only ever meaningful for role="assistant" -- pass
+        None for user messages and for assistant answers with none.
         No owner_token here by design: this is only ever called from
         ChatService AFTER the route layer has already verified
         ownership via get_conversation() for this request -- see

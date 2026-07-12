@@ -27,7 +27,7 @@ export default function Sidebar({
   onDelete,
 }) {
   return (
-    <div className="w-64 shrink-0 bg-[#0E1526] border-r border-[#2A3348] flex flex-col h-screen">
+    <div className="w-64 shrink-0 bg-[#0E1526] border-r border-[#2A3348] flex flex-col h-full">
       <div className="px-4 py-4 border-b border-[#2A3348]">
         <button
           onClick={onCreate}

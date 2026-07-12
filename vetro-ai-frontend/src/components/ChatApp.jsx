@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import Sidebar from "./Sidebar";
 import ChatInterface from "./ChatInterface";
-import { AUTH_HEADERS } from "../lib/ownerToken";
+import { apiGet, apiPost, apiDelete } from "../lib/apiClient";
 
 /**
  * ChatApp -- top-level container owning conversation list state.
@@ -10,8 +10,6 @@ import { AUTH_HEADERS } from "../lib/ownerToken";
  * same as ChatInterface already used internally for its own messages).
  */
 
-const API_BASE = "http://localhost:8000";
-
 export default function ChatApp() {
   const [conversations, setConversations] = useState([]);
   const [activeConversationId, setActiveConversationId] = useState(null);
@@ -19,9 +17,7 @@ export default function ChatApp() {
 
   const loadConversations = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/conversations`, { headers: AUTH_HEADERS });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const data = await res.json();
+      const data = await apiGet("/conversations");
       setConversations(data);
       return data;
     } catch (err) {
@@ -50,13 +46,7 @@ export default function ChatApp() {
 
   async function handleCreate() {
     try {
-      const res = await fetch(`${API_BASE}/conversations`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
-        body: JSON.stringify({}),
-      });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const conv = await res.json();
+      const conv = await apiPost("/conversations", {});
       setConversations((prev) => [
         { id: conv.id, title: conv.title, updated_at: conv.updated_at },
         ...prev,
@@ -73,11 +63,7 @@ export default function ChatApp() {
 
   async function handleDelete(id) {
     try {
-      const res = await fetch(`${API_BASE}/conversations/${id}`, {
-        method: "DELETE",
-        headers: AUTH_HEADERS,
-      });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      await apiDelete(`/conversations/${id}`);
 
       const remaining = conversations.filter((c) => c.id !== id);
       setConversations(remaining);
@@ -100,14 +86,14 @@ export default function ChatApp() {
 
   if (isLoading) {
     return (
-      <div className="flex h-screen bg-[#0B1120] items-center justify-center">
+      <div className="flex h-full bg-[#0B1120] items-center justify-center">
         <p className="text-xs text-[#4A5268] font-mono uppercase tracking-wider">Loading…</p>
       </div>
     );
   }
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-full">
       <Sidebar
         conversations={conversations}
         activeConversationId={activeConversationId}

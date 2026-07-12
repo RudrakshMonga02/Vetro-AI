@@ -11,6 +11,7 @@ found" result via the exact same code path, so there's no timing or
 behavioral difference an attacker could use to distinguish "wrong
 token" from "id doesn't exist".
 """
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -91,7 +92,7 @@ class PostgresConversationRepository(ConversationRepository):
         finally:
             session.close()
 
-    def get_messages(self, conversation_id: int, owner_token: str) -> list[dict[str, str]]:
+    def get_messages(self, conversation_id: int, owner_token: str) -> list[dict[str, Any]]:
         session = get_session()
         try:
             # Ownership check folded into the same query as the
@@ -114,11 +115,22 @@ class PostgresConversationRepository(ConversationRepository):
                 .order_by(Message.timestamp.asc(), Message.id.asc())
                 .all()
             )
-            return [{"role": m.role, "text": m.content} for m in rows]
+            result = []
+            for m in rows:
+                citations = None
+                if m.citations:
+                    try:
+                        citations = json.loads(m.citations)
+                    except ValueError:
+                        citations = None  # corrupt/unexpected value -- degrade, don't 500
+                result.append({"role": m.role, "text": m.content, "citations": citations})
+            return result
         finally:
             session.close()
 
-    def append_message(self, conversation_id: int, role: str, content: str) -> None:
+    def append_message(
+        self, conversation_id: int, role: str, content: str, citations: list[dict[str, Any]] | None = None
+    ) -> None:
         # No owner_token param by design -- see interface docstring.
         # The route layer already verified ownership via
         # get_conversation() before ChatService (and therefore this
@@ -130,6 +142,7 @@ class PostgresConversationRepository(ConversationRepository):
                 role=role,
                 content=content,
                 timestamp=_utcnow(),
+                citations=json.dumps(citations) if citations else None,
             )
             session.add(msg)
 

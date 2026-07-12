@@ -7,8 +7,8 @@ the returned object through the LLMProvider interface, never caring
 which backend is actually live.
 
 Usage:
-    LLM_BACKEND=gemini            -> GeminiProvider (current default)
-    LLM_BACKEND=catalyst_quickml  -> CatalystQuickMLProvider (not yet implemented)
+    LLM_BACKEND=gemini            -> GeminiProvider (fallback if LLM_BACKEND is unset)
+    LLM_BACKEND=catalyst_quickml  -> CatalystQuickMLProvider (project default -- see .env)
 
 Adding a new provider (OpenAI, Claude, a local model, etc.) means:
   1. Write infrastructure/llm/<new>_provider.py implementing LLMProvider

@@ -165,10 +165,15 @@ class CatalystCaseRepository(CaseRepository):
             for r in result
         ]
 
-    def get_monthly_trend(self, district: str | None = None) -> list[dict[str, Any]]:
+    def get_monthly_trend(
+        self, district: str | None = None, crime_type: str | None = None
+    ) -> list[dict[str, Any]]:
         # NOTE: ZCQL's date-formatting function support may differ from Postgres'
         # to_char(). Verify ZCQL's date/string function docs for the equivalent --
         # this may need adjustment once tested against a real project.
+        # crime_type filter accepted for interface compatibility but not yet
+        # wired into this query -- same untested status as the rest of this
+        # module, see its docstring.
         query = """
             SELECT CaseMaster.CrimeRegisteredDate, COUNT(CaseMaster.CaseMasterID)
             FROM CaseMaster
@@ -190,9 +195,16 @@ class CatalystCaseRepository(CaseRepository):
             monthly[month] = monthly.get(month, 0) + count
         return [{"month": m, "count": c} for m, c in sorted(monthly.items())]
 
-    def get_cases_for_map(self, limit: int = 5000) -> list[dict[str, Any]]:
+    def get_cases_for_map(
+        self, limit: int = 5000, crime_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        # NOTE: crime_type filter not yet wired into the ZCQL query below --
+        # untested against a real Catalyst project either way (see module
+        # docstring), so this param is accepted for interface compatibility
+        # but not yet applied. Add a WHERE clause here once this backend
+        # is actually being implemented for real.
         query = f"""
-            SELECT CaseMaster.latitude, CaseMaster.longitude,
+            SELECT CaseMaster.CaseMasterID, CaseMaster.latitude, CaseMaster.longitude,
                    CrimeSubHead.CrimeHeadName, CaseMaster.CrimeRegisteredDate
             FROM CaseMaster
             JOIN CrimeSubHead ON CaseMaster.CrimeMinorHeadID = CrimeSubHead.CrimeSubHeadID
@@ -202,6 +214,7 @@ class CatalystCaseRepository(CaseRepository):
         result = self.zcql.execute_query(query)
         return [
             {
+                "case_id": r["CaseMaster"]["CaseMasterID"],
                 "lat": float(r["CaseMaster"]["latitude"]),
                 "lng": float(r["CaseMaster"]["longitude"]),
                 "crime_type": r["CrimeSubHead"]["CrimeHeadName"],
@@ -211,6 +224,13 @@ class CatalystCaseRepository(CaseRepository):
         ]
 
     def get_case_network(self, case_id: int) -> dict[str, Any]:
+        # KNOWN GAP vs. postgres_repository.py: the Postgres implementation
+        # now flags accused nodes with cross_case/case_count (a same-name
+        # distinct-CaseMasterID count) -- this draft does not yet do the
+        # equivalent ZCQL query. Untested against a real Catalyst project
+        # either way; add this when this backend actually gets implemented
+        # for real rather than guessing ZCQL aggregate syntax blind.
+        #
         # Defense-in-depth: cast explicitly rather than trusting that
         # every future caller of this method goes through a route with
         # `case_id: int` type coercion (see docs/PRD.md vulnerability
@@ -223,21 +243,29 @@ class CatalystCaseRepository(CaseRepository):
         case_id = int(case_id)
 
         victims = self.zcql.execute_query(
-            f"SELECT VictimMasterID, VictimName FROM Victim WHERE CaseMasterID = {case_id}"
+            f"SELECT VictimMasterID, VictimName, AgeYear, GenderID FROM Victim "
+            f"WHERE CaseMasterID = {case_id}"
         )
         accused = self.zcql.execute_query(
-            f"SELECT AccusedMasterID, AccusedName FROM Accused WHERE CaseMasterID = {case_id}"
+            f"SELECT AccusedMasterID, AccusedName, AgeYear, GenderID FROM Accused "
+            f"WHERE CaseMasterID = {case_id}"
         )
 
         nodes = [{"id": f"case_{case_id}", "label": f"Case {case_id}", "type": "case"}]
         edges = []
         for v in victims:
             vid = v["Victim"]["VictimMasterID"]
-            nodes.append({"id": f"victim_{vid}", "label": v["Victim"]["VictimName"], "type": "victim"})
+            nodes.append({
+                "id": f"victim_{vid}", "label": v["Victim"]["VictimName"], "type": "victim",
+                "age": v["Victim"].get("AgeYear"), "gender": v["Victim"].get("GenderID"),
+            })
             edges.append({"source": f"case_{case_id}", "target": f"victim_{vid}"})
         for a in accused:
             aid = a["Accused"]["AccusedMasterID"]
-            nodes.append({"id": f"accused_{aid}", "label": a["Accused"]["AccusedName"], "type": "accused"})
+            nodes.append({
+                "id": f"accused_{aid}", "label": a["Accused"]["AccusedName"], "type": "accused",
+                "age": a["Accused"].get("AgeYear"), "gender": a["Accused"].get("GenderID"),
+            })
             edges.append({"source": f"case_{case_id}", "target": f"accused_{aid}"})
 
         # Arrest events for this case, and the junction table linking
@@ -282,3 +310,33 @@ class CatalystCaseRepository(CaseRepository):
         table = self.datastore.table("CaseMaster")
         row = table.insert_row(case_data)
         return row["ROWID"]
+
+    def get_cross_case_links(self, accused_name: str) -> dict[str, Any]:
+        # NOT YET IMPLEMENTED against a real Catalyst project -- Data
+        # Store integration is deferred (see docs/PRD.md). Exists only
+        # so CatalystCaseRepository still satisfies the CaseRepository
+        # ABC and can be instantiated; DATA_BACKEND=catalyst must not
+        # be selected until this is filled in.
+        raise NotImplementedError(
+            "get_cross_case_links: Catalyst Data Store backend not yet implemented"
+        )
+
+    def get_repeat_offender_network(self, min_case_count: int = 2) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            "get_repeat_offender_network: Catalyst Data Store backend not yet implemented"
+        )
+
+    def get_case_timeline(self, case_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            "get_case_timeline: Catalyst Data Store backend not yet implemented"
+        )
+
+    def get_investigative_leads(self, case_id: int) -> dict[str, Any]:
+        raise NotImplementedError(
+            "get_investigative_leads: Catalyst Data Store backend not yet implemented"
+        )
+
+    def get_sociological_breakdown(self, crime_type: str | None = None) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            "get_sociological_breakdown: Catalyst Data Store backend not yet implemented"
+        )
