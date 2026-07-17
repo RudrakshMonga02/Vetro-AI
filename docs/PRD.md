@@ -1056,3 +1056,66 @@ current priority order.
     verification standard as the rest of this session. Real browser click-through (citations, the
     cross-case marker, map clustering, timeline/leads panels) remains the one open item, deferred to
     either a future session with working Playwright or the user checking manually.
+
+- **[Feature -- Network Graph smarter connections + Offender Profiling search]** User asked specifically
+  to make Network Graph "smarter." Presented four grounded options (risk-weighted nodes, weighted
+  co-accused edges, find-connection-path search, MO-similarity edges) with concrete before/after
+  scenarios rather than jargon after the user pushed back asking what "MO" even meant and how each
+  would actually help -- picked weighted edges, path search, and MO-similarity, plus a specific UX:
+  hover a person for a quick summary, click an accused to jump straight into their full Offender
+  Profiling record, and a matching name-or-case-ID search in Offender Profiling itself. Planned via
+  full plan-mode (2 parallel Explore agents covering backend repository/schema patterns and frontend
+  component/Cytoscape patterns) before writing any code, given the size (touches the DB schema, the
+  `CaseRepository` interface + both implementations, 3 routes, 3 frontend components).
+  **Key design decision:** MO extraction was only ever cached ephemerally (24h TTL, exact-key lookup).
+  "Find cases with similar MO" needs to compare across many cases' keywords, which no exact-key cache
+  can do -- moved MO storage to a new permanent `case_mo_extraction` table (case's `BriefFacts` never
+  changes once seeded, so an extraction is effectively permanent anyway; this is strictly simpler than
+  the cache it replaces, not an added system). Quota discipline carried over unchanged: similarity
+  comparison only runs against cases that ALREADY have a persisted MO (someone clicked "Extract MO" on
+  them before) -- nothing is bulk-extracted automatically.
+  **Backend:** `CaseRepository` gained `get_mo_extraction`/`save_mo_extraction`/`get_similar_mo_cases`
+  (Postgres implemented; Catalyst stubs added, same `NotImplementedError` pattern as every other
+  deferred method). `get_similar_mo_cases` bounds comparison to the SAME crime sub-head as the target
+  case (comparing a burglary's MO to a cybercrime's is noise) and requires a Python-side keyword-set
+  intersection &ge; a threshold (default 2) -- no ML/embeddings, consistent with this project's existing
+  "closed-form over ML" bias (`forecasting.py`'s linear OLS). `get_case_network()` extended with a new
+  `case_context` field (crime type/district/date/brief snippet/MO if already extracted) by internally
+  reusing `get_case_by_id()`/`get_mo_extraction()` rather than duplicating their joins -- this is what
+  lets the new hover tooltip show real content with zero extra fetches, since it rides along on the one
+  request the graph view already makes. `/offenders/case/{id}/mo` switched from the ephemeral cache to
+  the new table; new `GET /offenders/case/{id}/similar-mo`.
+  **Frontend:** `NetworkGraphView.jsx`'s aggregate-graph builder now weights co-accused edges by shared
+  case count instead of drawing duplicate overlapping edges. New path-finding UI uses Cytoscape's own
+  built-in `dijkstra()`/`pathTo()` (already a direct dependency, no new package) against the live `cy`
+  instance, exposed via a new `onCyReady` callback prop on `CaseGraph.jsx`. `CaseGraph.jsx` gained a
+  floating hover tooltip (victim/accused nodes only, sourced entirely from `case_context`, no new
+  fetch) and accused-node clicks now navigate straight to `/offenders?name=...` instead of only opening
+  the existing side panel (victim/case/arrest_event nodes keep the old side-panel click behavior --
+  they have no profile page to jump to). New "Find Similar-MO Cases" button merges results into the
+  already-rendered graph as dotted-purple nodes/edges rather than a full reload. `OffenderProfilingView.jsx`
+  gained a search box: digits resolve as a Case ID (via the existing `/graph/case/{id}` payload's
+  accused nodes), text first checks the already-loaded repeat-offender list client-side, then falls
+  back to `/offenders/{name}/cases` (confirmed this already supports ANY accused name with 1+ cases,
+  not just repeat offenders) so a single-case offender who'd never appear in the repeat-offender list
+  is still reachable. `?name=` syncs via `useSearchParams`, same deep-link pattern `NetworkGraphView`
+  already used for `?case=`/`?offender=` -- this is also what makes the new click-through from
+  `CaseGraph` land correctly.
+  **Verified live, real data, not mocked:** extracted MO for 4 real same-crime-type (Dacoity) cases
+  (1, 9, 23, 29) and confirmed the similarity match was semantically real, not coincidental -- case 1
+  and case 29 correctly matched on genuinely shared keywords ("dacoity", "armed robbery"), while case 9
+  (a residential-burglary-style Dacoity) and case 23 (1 shared keyword, below the min-shared-2
+  threshold) correctly did NOT match. Confirmed `/case/{id}/mo`'s second call returns from the DB in
+  ~0.27s with no LLM round-trip. Drove the actual running frontend with Playwright (installed manually
+  this session): hover tooltip on a real accused node showed the real MO summary and case context
+  exactly as designed; "Find Similar-MO Cases" button produced the real case-29 dotted-purple node
+  live in the browser; Offender Profiling correctly deep-linked via `?name=` and correctly resolved a
+  Case-ID search (394) and a case-insensitive name search to the same real repeat offender (Manthan
+  Mishra); path-finding's same-name and unknown-name guards both fired correctly. Zero console/page
+  errors across the whole session.
+  **Honest gap, not silently skipped:** weighted co-accused edges and multi-offender path-finding
+  could not be empirically demonstrated with real data -- the current seeded dataset has exactly ONE
+  repeat offender and zero co-accused pairs, so there's nothing to show multiple weighted edges or a
+  multi-hop path between. The code was traced carefully and reuses the same `buildAggregateGraph`/
+  Cytoscape mechanics already proven correct in production, but this specific claim rests on code
+  review, not a live demonstration, until the dataset has an actual co-accused pair to test against.

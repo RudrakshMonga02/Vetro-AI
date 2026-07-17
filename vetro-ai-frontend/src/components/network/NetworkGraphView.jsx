@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Search, Share2, GitBranch } from "lucide-react";
+import { Search, Share2, GitBranch, Route, Sparkles, Loader2 } from "lucide-react";
 import { apiGet } from "../../lib/apiClient";
 import CaseGraph from "./CaseGraph";
 import CaseTimeline from "./CaseTimeline";
@@ -15,10 +15,13 @@ import Badge from "../ui/Badge";
  * the already-fetched /offenders/repeat response -- no new backend
  * endpoint. Nodes = offenders + the cases they appear in; a same-case
  * edge is drawn between two different offenders who are co-accused in
- * the same case_id (a real organized-crime-adjacent signal). */
+ * the same case_id (a real organized-crime-adjacent signal), WEIGHTED
+ * by how many different cases the same pair shares -- an established
+ * pairing across 3 cases should read very differently from a one-off
+ * co-arrest, not as 3 overlapping identical lines. */
 function buildAggregateGraph(offenders) {
   const nodes = new Map();
-  const edges = [];
+  const caseEdges = [];
   const caseToOffenders = new Map();
 
   for (const o of offenders) {
@@ -29,21 +32,27 @@ function buildAggregateGraph(offenders) {
       if (!nodes.has(caseId)) {
         nodes.set(caseId, { id: caseId, label: `Case ${c.case_id}`, type: "case" });
       }
-      edges.push({ source: offenderId, target: caseId });
+      caseEdges.push({ source: offenderId, target: caseId, type: "appears-in" });
       if (!caseToOffenders.has(c.case_id)) caseToOffenders.set(c.case_id, []);
       caseToOffenders.get(c.case_id).push(offenderId);
     }
   }
 
+  const edgeWeights = new Map(); // "idA|idB" (sorted) -> shared-case count
   for (const offenderIds of caseToOffenders.values()) {
     for (let i = 0; i < offenderIds.length; i++) {
       for (let j = i + 1; j < offenderIds.length; j++) {
-        edges.push({ source: offenderIds[i], target: offenderIds[j], label: "co-accused" });
+        const key = [offenderIds[i], offenderIds[j]].sort().join("|");
+        edgeWeights.set(key, (edgeWeights.get(key) ?? 0) + 1);
       }
     }
   }
+  const coAccusedEdges = Array.from(edgeWeights.entries()).map(([key, weight]) => {
+    const [source, target] = key.split("|");
+    return { source, target, weight, type: "co-accused" };
+  });
 
-  return { nodes: Array.from(nodes.values()), edges };
+  return { nodes: Array.from(nodes.values()), edges: [...caseEdges, ...coAccusedEdges] };
 }
 
 export default function NetworkGraphView() {
@@ -61,11 +70,25 @@ export default function NetworkGraphView() {
   const [loadingOffenders, setLoadingOffenders] = useState(true);
   const [selectedOffender, setSelectedOffender] = useState(null);
 
+  // Path-finding (aggregate mode) -- operates on the live Cytoscape
+  // instance via cy.elements().dijkstra(), not a new backend endpoint;
+  // the aggregate graph is already fully loaded client-side.
+  const cyInstanceRef = useRef(null);
+  const [pathFrom, setPathFrom] = useState("");
+  const [pathTo, setPathTo] = useState("");
+  const [pathMessage, setPathMessage] = useState(null);
+
+  // Similar-MO cases (single-case mode) -- merged into the currently
+  // loaded graph's nodes/edges rather than a full reload.
+  const [loadingSimilarMo, setLoadingSimilarMo] = useState(false);
+  const [similarMoStatus, setSimilarMoStatus] = useState(null); // null | "done" | "empty" | "error"
+
   const loadCase = useCallback(async (caseId) => {
     if (!caseId) return;
     setLoadingGraph(true);
     setGraphError(null);
     setSelectedNode(null);
+    setSimilarMoStatus(null);
     try {
       const data = await apiGet(`/graph/case/${caseId}`);
       setGraph(data);
@@ -87,7 +110,8 @@ export default function NetworkGraphView() {
   }, []);
 
   // Deep-linking: ?case=<id> loads that case directly (used by citation
-  // badges in Chat and the Hotspot Map case-list drill-down); ?offender=
+  // badges in Chat, the Hotspot Map case-list drill-down, and now
+  // CaseGraph's own accused-node click within a case); ?offender=
   // switches into aggregate mode with that offender pre-selected (used
   // by Offender Profiling's "View Network" button).
   useEffect(() => {
@@ -117,6 +141,7 @@ export default function NetworkGraphView() {
   function handleModeChange(next) {
     setMode(next);
     setSelectedNode(null);
+    setPathMessage(null);
     if (next === "single") setSearchParams(caseIdInput ? { case: caseIdInput } : {});
     else setSearchParams(selectedOffender ? { offender: selectedOffender.accused_name } : {});
   }
@@ -124,6 +149,70 @@ export default function NetworkGraphView() {
   function handleSearchSubmit() {
     setSearchParams({ case: caseIdInput });
     loadCase(caseIdInput);
+  }
+
+  function handleFindPath() {
+    const cy = cyInstanceRef.current;
+    if (!cy || !pathFrom.trim() || !pathTo.trim()) return;
+    cy.elements().removeClass("path-highlight");
+
+    const fromNode = cy.getElementById(`offender_${pathFrom.trim()}`);
+    const toNode = cy.getElementById(`offender_${pathTo.trim()}`);
+    if (fromNode.empty() || toNode.empty()) {
+      setPathMessage("Enter two exact offender names from the list on the left.");
+      return;
+    }
+    if (fromNode.id() === toNode.id()) {
+      setPathMessage("Enter two different names.");
+      return;
+    }
+
+    const dijkstra = cy.elements().dijkstra({ root: fromNode, directed: false });
+    const path = dijkstra.pathTo(toNode);
+    if (!path || path.length === 0) {
+      setPathMessage("No connection found between these two.");
+      return;
+    }
+    path.addClass("path-highlight");
+    const hops = (path.length - 1) / 2;
+    setPathMessage(`Connected — ${hops} hop${hops === 1 ? "" : "s"} apart.`);
+  }
+
+  async function handleFindSimilarMo() {
+    if (!loadedCaseId) return;
+    setLoadingSimilarMo(true);
+    setSimilarMoStatus(null);
+    try {
+      const result = await apiGet(`/offenders/case/${loadedCaseId}/similar-mo`);
+      if (!result.similar_cases || result.similar_cases.length === 0) {
+        setSimilarMoStatus("empty");
+        return;
+      }
+      setGraph((prev) => {
+        if (!prev) return prev;
+        const existingIds = new Set(prev.nodes.map((n) => n.id));
+        const newNodes = [];
+        const newEdges = [];
+        for (const c of result.similar_cases) {
+          const nodeId = `case_${c.case_id}`;
+          if (!existingIds.has(nodeId)) {
+            newNodes.push({ id: nodeId, label: `Case ${c.case_id}`, type: "case", similar_mo: true });
+          }
+          newEdges.push({
+            source: `case_${loadedCaseId}`,
+            target: nodeId,
+            type: "similar-mo",
+            label: `${c.shared_keywords.length} shared`,
+          });
+        }
+        return { ...prev, nodes: [...prev.nodes, ...newNodes], edges: [...prev.edges, ...newEdges] };
+      });
+      setSimilarMoStatus("done");
+    } catch {
+      setSimilarMoStatus("error");
+    } finally {
+      setLoadingSimilarMo(false);
+    }
   }
 
   const activeGraph = mode === "single" ? graph : aggregateGraph;
@@ -158,7 +247,7 @@ export default function NetworkGraphView() {
             </div>
             <p className="text-[11px] text-ink-faint mt-2 leading-snug">
               {mode === "single"
-                ? "One case's victim/accused/arrest links."
+                ? "One case's victim/accused/arrest links. Hover a person for a quick summary, click an accused for their full profile."
                 : "All repeat offenders and the cases connecting them. Name-matched, not verified identity."}
             </p>
           </div>
@@ -207,6 +296,44 @@ export default function NetworkGraphView() {
           </button>
         </div>
       )}
+      {mode === "aggregate" && (
+        <div className="px-6 py-3 border-b border-line flex items-center gap-3">
+          <Route className="w-4 h-4 text-ink-faint shrink-0" />
+          <input
+            value={pathFrom}
+            onChange={(e) => setPathFrom(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleFindPath()}
+            placeholder="Person A"
+            list="offender-names"
+            className="w-48 bg-transparent text-sm text-ink-primary placeholder-ink-dim
+                       focus:outline-none font-mono"
+          />
+          <span className="text-ink-dim text-xs">&rarr;</span>
+          <input
+            value={pathTo}
+            onChange={(e) => setPathTo(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleFindPath()}
+            placeholder="Person B"
+            list="offender-names"
+            className="w-48 bg-transparent text-sm text-ink-primary placeholder-ink-dim
+                       focus:outline-none font-mono"
+          />
+          <datalist id="offender-names">
+            {repeatOffenders.map((o) => (
+              <option key={o.accused_name} value={o.accused_name} />
+            ))}
+          </datalist>
+          <button
+            onClick={handleFindPath}
+            className="text-xs font-mono uppercase tracking-wider text-accent hover:text-accent-hover shrink-0"
+          >
+            Find Path
+          </button>
+          {pathMessage && (
+            <span className="text-[11px] text-ink-faint font-mono truncate">{pathMessage}</span>
+          )}
+        </div>
+      )}
       <div className="flex-1 min-h-0 flex">
         <div className="flex-1 min-w-0 relative">
           {mode === "single" && loadingGraph && (
@@ -223,7 +350,13 @@ export default function NetworkGraphView() {
             <EmptyState title="No repeat-offender network to show" />
           )}
           {activeGraph && (mode === "single" ? !graphError : true) && (
-            <CaseGraph graph={activeGraph} onNodeClick={setSelectedNode} />
+            <CaseGraph
+              graph={activeGraph}
+              onNodeClick={setSelectedNode}
+              onCyReady={(cy) => {
+                cyInstanceRef.current = cy;
+              }}
+            />
           )}
         </div>
         {(selectedNode || (mode === "single" && loadedCaseId)) && (
@@ -241,20 +374,48 @@ export default function NetworkGraphView() {
                     {selectedNode.gender}
                   </p>
                 )}
-                {selectedNode.crossCase && (
-                  <button
-                    onClick={() => handleSelectOffender({ accused_name: selectedNode.label })}
-                    className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider
-                               text-accent hover:text-accent-hover mt-3"
-                  >
-                    <GitBranch className="w-3 h-3" />
-                    Repeat offender — {selectedNode.caseCount} cases, view network
-                  </button>
-                )}
               </div>
             )}
             {mode === "single" && loadedCaseId && (
               <>
+                <div className="border border-line rounded p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-ink-faint">
+                      Similar-MO Cases
+                    </span>
+                    {similarMoStatus !== "done" && (
+                      <button
+                        onClick={handleFindSimilarMo}
+                        disabled={loadingSimilarMo}
+                        className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider
+                                   text-accent hover:text-accent-hover disabled:opacity-40"
+                      >
+                        {loadingSimilarMo ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3 h-3" />
+                        )}
+                        Find Similar-MO Cases
+                      </button>
+                    )}
+                  </div>
+                  {similarMoStatus === "done" && (
+                    <p className="text-[11px] text-ink-secondary mt-2">
+                      Added to the graph above (dotted purple).
+                    </p>
+                  )}
+                  {similarMoStatus === "empty" && (
+                    <p className="text-[11px] text-ink-faint mt-2">
+                      No other case with the same crime type and an already-extracted MO shares
+                      enough keywords with this one.
+                    </p>
+                  )}
+                  {similarMoStatus === "error" && (
+                    <p className="text-[11px] text-status-error mt-2">
+                      Similar-MO lookup unavailable right now.
+                    </p>
+                  )}
+                </div>
                 <CaseTimeline caseId={loadedCaseId} />
                 <CaseLeads caseId={loadedCaseId} />
               </>

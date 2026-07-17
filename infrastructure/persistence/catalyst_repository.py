@@ -340,3 +340,22 @@ class CatalystCaseRepository(CaseRepository):
         raise NotImplementedError(
             "get_sociological_breakdown: Catalyst Data Store backend not yet implemented"
         )
+
+    def get_mo_extraction(self, case_id: int) -> dict[str, Any] | None:
+        raise NotImplementedError(
+            "get_mo_extraction: Catalyst Data Store backend not yet implemented"
+        )
+
+    def save_mo_extraction(
+        self, case_id: int, mo_summary: str | None, keywords: list[str]
+    ) -> None:
+        raise NotImplementedError(
+            "save_mo_extraction: Catalyst Data Store backend not yet implemented"
+        )
+
+    def get_similar_mo_cases(
+        self, case_id: int, keywords: list[str], min_shared: int = 2, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            "get_similar_mo_cases: Catalyst Data Store backend not yet implemented"
+        )

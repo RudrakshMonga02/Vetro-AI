@@ -381,3 +381,18 @@ class Message(Base):
     citations = Column(Text, nullable=True)
 
     conversation = relationship("Conversation", back_populates="messages")
+
+
+# Not part of the original FIR ER diagram -- app-level table. Persists
+# MO (modus operandi) extraction results permanently rather than in the
+# ephemeral 24h response cache used elsewhere: a case's BriefFacts never
+# changes once seeded, so an extracted MO is effectively permanent, and
+# "find cases with similar MO" needs to compare across many cases'
+# keywords -- something an exact-key cache backend (Catalyst Cache) has
+# no way to list/query, but a real table does.
+class CaseMoExtraction(Base):
+    __tablename__ = "case_mo_extraction"
+    case_id = Column(Integer, ForeignKey("case_master.CaseMasterID"), primary_key=True)
+    mo_summary = Column(Text, nullable=True)
+    keywords = Column(Text, nullable=False)  # JSON-encoded list[str]
+    extracted_at = Column(DateTime, nullable=False)
