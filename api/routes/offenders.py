@@ -99,6 +99,17 @@ async def similar_mo_cases(request: Request, case_id: int, min_shared: int = 2, 
             )
         repo.save_mo_extraction(case_id, result.get("mo_summary"), result["keywords"])
         existing = {"mo_summary": result.get("mo_summary"), "keywords": result["keywords"]}
+    elif not existing.get("keywords"):
+        # A previously-persisted extraction can itself have empty keywords
+        # (e.g. the case had no BriefFacts at the time -- see extract_mo()'s
+        # short-circuit) -- that's a real, already-saved row, so the "if
+        # existing is None" branch above never runs for it. Without this
+        # check it would fall through and get_similar_mo_cases() would just
+        # silently return [] (its own empty-keyword-set guard), which reads
+        # to the caller as "no similar cases" rather than "no MO to compare."
+        raise HTTPException(
+            status_code=400, detail="MO extraction unavailable for this case"
+        )
 
     similar = repo.get_similar_mo_cases(
         case_id, existing["keywords"], min_shared=min_shared, limit=limit

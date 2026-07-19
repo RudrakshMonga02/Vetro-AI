@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db.connection import get_session
 from db.models import (
@@ -530,20 +531,28 @@ class PostgresCaseRepository(CaseRepository):
     def save_mo_extraction(
         self, case_id: int, mo_summary: str | None, keywords: list[str]
     ) -> None:
+        # Atomic upsert, not query-then-insert -- two concurrent requests
+        # for the same not-yet-extracted case (e.g. "Extract MO" racing
+        # "Find Similar-MO Cases", or a double-click) could otherwise both
+        # see no existing row and both INSERT, with the second hitting a
+        # primary-key violation on case_id.
         session = get_session()
         try:
-            row = session.query(CaseMoExtraction).filter_by(case_id=case_id).first()
-            if row:
-                row.mo_summary = mo_summary
-                row.keywords = json.dumps(keywords)
-                row.extracted_at = datetime.utcnow()
-            else:
-                session.add(CaseMoExtraction(
-                    case_id=case_id,
-                    mo_summary=mo_summary,
-                    keywords=json.dumps(keywords),
-                    extracted_at=datetime.utcnow(),
-                ))
+            stmt = pg_insert(CaseMoExtraction).values(
+                case_id=case_id,
+                mo_summary=mo_summary,
+                keywords=json.dumps(keywords),
+                extracted_at=datetime.utcnow(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[CaseMoExtraction.case_id],
+                set_={
+                    "mo_summary": stmt.excluded.mo_summary,
+                    "keywords": stmt.excluded.keywords,
+                    "extracted_at": stmt.excluded.extracted_at,
+                },
+            )
+            session.execute(stmt)
             session.commit()
         finally:
             session.close()

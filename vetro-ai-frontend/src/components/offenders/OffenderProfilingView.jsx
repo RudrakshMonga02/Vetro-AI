@@ -111,13 +111,20 @@ export default function OffenderProfilingView() {
   useEffect(() => {
     const nameParam = searchParams.get("name");
     if (!nameParam || loading) return;
+    // Already showing this offender -- skip. Without this, changing
+    // minCaseCount (which toggles `loading` false->true->false and
+    // re-fetches `offenders`) re-runs this effect and would redundantly
+    // re-select/re-fetch the same name even though the URL never
+    // changed, and could flicker a stale searchError.
+    if (selected?.accused_name === nameParam) return;
     const localMatch = offenders.find((o) => o.accused_name === nameParam);
     if (localMatch) {
+      setSearchError(null);
       setSelected(localMatch);
     } else {
-      loadOffenderByName(nameParam).catch(() =>
-        setSearchError("No matching case or offender found.")
-      );
+      loadOffenderByName(nameParam)
+        .then(() => setSearchError(null))
+        .catch(() => setSearchError("No matching case or offender found."));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, loading]);

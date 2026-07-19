@@ -33,13 +33,21 @@ function buildAggregateGraph(offenders) {
         nodes.set(caseId, { id: caseId, label: `Case ${c.case_id}`, type: "case" });
       }
       caseEdges.push({ source: offenderId, target: caseId, type: "appears-in" });
-      if (!caseToOffenders.has(c.case_id)) caseToOffenders.set(c.case_id, []);
-      caseToOffenders.get(c.case_id).push(offenderId);
+      // Set, not array/push -- name-matching is explicitly fuzzy
+      // throughout this app (two different real people can share a
+      // Faker-generated name), so the same offenderId legitimately can
+      // appear more than once for the same case_id. Without dedup that
+      // produces a nonsensical self-edge (a person "co-accused with
+      // themselves") and double-counts their weight with everyone else
+      // in the case.
+      if (!caseToOffenders.has(c.case_id)) caseToOffenders.set(c.case_id, new Set());
+      caseToOffenders.get(c.case_id).add(offenderId);
     }
   }
 
   const edgeWeights = new Map(); // "idA|idB" (sorted) -> shared-case count
-  for (const offenderIds of caseToOffenders.values()) {
+  for (const offenderIdSet of caseToOffenders.values()) {
+    const offenderIds = Array.from(offenderIdSet);
     for (let i = 0; i < offenderIds.length; i++) {
       for (let j = i + 1; j < offenderIds.length; j++) {
         const key = [offenderIds[i], offenderIds[j]].sort().join("|");
@@ -65,6 +73,11 @@ export default function NetworkGraphView() {
   const [loadingGraph, setLoadingGraph] = useState(false);
   const [selectedNode, setSelectedNode] = useState(null);
   const [loadedCaseId, setLoadedCaseId] = useState(null);
+  // Mirrors loadedCaseId for handleFindSimilarMo's async guard below --
+  // a ref (not the state value) so the check inside that function
+  // always reads the truly-current case, not whatever was captured in
+  // its closure when the request was fired.
+  const loadedCaseIdRef = useRef(null);
 
   const [repeatOffenders, setRepeatOffenders] = useState([]);
   const [loadingOffenders, setLoadingOffenders] = useState(true);
@@ -93,9 +106,11 @@ export default function NetworkGraphView() {
       const data = await apiGet(`/graph/case/${caseId}`);
       setGraph(data);
       setLoadedCaseId(caseId);
+      loadedCaseIdRef.current = caseId;
     } catch {
       setGraph(null);
       setLoadedCaseId(null);
+      loadedCaseIdRef.current = null;
       setGraphError(`Case ${caseId} not found or has no linked records.`);
     } finally {
       setLoadingGraph(false);
@@ -180,10 +195,17 @@ export default function NetworkGraphView() {
 
   async function handleFindSimilarMo() {
     if (!loadedCaseId) return;
+    // Captured up front, not re-read from state after the await --
+    // if the user switches to a different case while this request is
+    // in flight, loadedCaseId (and loadedCaseIdRef) will have moved on,
+    // and this stale response must never merge into the NEW case's
+    // graph or overwrite its status message.
+    const requestedCaseId = loadedCaseId;
     setLoadingSimilarMo(true);
     setSimilarMoStatus(null);
     try {
-      const result = await apiGet(`/offenders/case/${loadedCaseId}/similar-mo`);
+      const result = await apiGet(`/offenders/case/${requestedCaseId}/similar-mo`);
+      if (loadedCaseIdRef.current !== requestedCaseId) return;
       if (!result.similar_cases || result.similar_cases.length === 0) {
         setSimilarMoStatus("empty");
         return;
@@ -199,7 +221,7 @@ export default function NetworkGraphView() {
             newNodes.push({ id: nodeId, label: `Case ${c.case_id}`, type: "case", similar_mo: true });
           }
           newEdges.push({
-            source: `case_${loadedCaseId}`,
+            source: `case_${requestedCaseId}`,
             target: nodeId,
             type: "similar-mo",
             label: `${c.shared_keywords.length} shared`,
@@ -209,7 +231,7 @@ export default function NetworkGraphView() {
       });
       setSimilarMoStatus("done");
     } catch {
-      setSimilarMoStatus("error");
+      if (loadedCaseIdRef.current === requestedCaseId) setSimilarMoStatus("error");
     } finally {
       setLoadingSimilarMo(false);
     }
