@@ -4,7 +4,7 @@ models already defined in db/models.py. This is what Stage 2 (FastAPI)
 uses while developing against Supabase.
 """
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func
@@ -542,7 +542,7 @@ class PostgresCaseRepository(CaseRepository):
                 case_id=case_id,
                 mo_summary=mo_summary,
                 keywords=json.dumps(keywords),
-                extracted_at=datetime.utcnow(),
+                extracted_at=datetime.now(timezone.utc),
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=[CaseMoExtraction.case_id],
