@@ -71,9 +71,17 @@ class CaseRepository(ABC):
 
     @abstractmethod
     def get_case_network(self, case_id: int) -> dict[str, Any]:
-        """Return nodes/edges for a case's Victim/Accused/ArrestSurrender graph.
-        Victim/accused node dicts include 'age'/'gender' alongside 'label' so a
-        frontend detail panel doesn't need a second fetch."""
+        """Return {'nodes', 'edges', 'case_context'} for a case's
+        Victim/Accused/ArrestSurrender graph. Victim/accused node dicts
+        include 'age'/'gender' alongside 'label' so a frontend detail
+        panel doesn't need a second fetch.
+
+        'case_context' is {'crime_type', 'district', 'date', 'brief'
+        (truncated), 'mo_summary', 'keywords'} -- the last two are None/[]
+        unless get_mo_extraction() already has a persisted row for this
+        case. This is what lets a frontend hover tooltip show real case
+        context with zero extra fetches, since it rides along on the one
+        request the graph view already makes on load."""
         ...
 
     @abstractmethod
@@ -154,4 +162,46 @@ class CaseRepository(ABC):
         in the UI, never 'offender demographics' -- the data doesn't
         support that claim and presenting it that way would be a
         seriously misleading criminological statement."""
+        ...
+
+    @abstractmethod
+    def get_mo_extraction(self, case_id: int) -> dict[str, Any] | None:
+        """Return {'mo_summary': str|None, 'keywords': list[str]} if this
+        case already has a persisted MO (modus operandi) extraction, else
+        None. Never triggers an LLM call itself -- pure DB read. See
+        api/services/mo_extraction.py's extract_mo() for the LLM call
+        that produces the values this stores."""
+        ...
+
+    @abstractmethod
+    def save_mo_extraction(
+        self, case_id: int, mo_summary: str | None, keywords: list[str]
+    ) -> None:
+        """Persist an already-extracted MO for this case. Upsert -- safe
+        to call again for the same case_id (e.g. if a caller wants to
+        re-extract), though nothing currently does that."""
+        ...
+
+    @abstractmethod
+    def get_similar_mo_cases(
+        self, case_id: int, keywords: list[str], min_shared: int = 2, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return cases with the SAME crime sub-head as case_id (comparing
+        MO across unrelated crime types, e.g. burglary vs cybercrime, is
+        noise, not signal) that already have a persisted MO extraction
+        (get_mo_extraction() returns non-None for them) AND share at least
+        min_shared of the given keywords, excluding case_id itself.
+
+        This is the one signal in this app that can link two cases with
+        NO shared accused name -- e.g. two unsolved burglaries with the
+        same rear-entry/nighttime/occupied-residence MO, before anyone's
+        been identified in either. Deliberately does not extract MO for
+        candidate cases that don't already have one -- see
+        api/routes/offenders.py's /case/{id}/similar-mo for why (quota
+        discipline: only compares against cases someone has already
+        chosen to run 'Extract MO' on, never bulk-extracts).
+
+        Returns [{'case_id', 'crime_no', 'district', 'crime_type', 'date',
+        'shared_keywords': list[str], 'mo_summary'}, ...], sorted by
+        number of shared keywords descending."""
         ...

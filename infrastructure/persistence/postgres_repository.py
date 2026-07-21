@@ -3,16 +3,19 @@ Postgres/Supabase implementation of CaseRepository, using the SQLAlchemy
 models already defined in db/models.py. This is what Stage 2 (FastAPI)
 uses while developing against Supabase.
 """
+import json
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db.connection import get_session
 from db.models import (
     CaseMaster, District, CrimeSubHead, CrimeHead, CaseCategory,
     GravityOffence, CaseStatusMaster, Victim, Accused, ArrestSurrender,
     CasteMaster, ReligionMaster, OccupationMaster, ComplainantDetails,
-    ChargesheetDetails,
+    ChargesheetDetails, CaseMoExtraction,
 )
 from domain.interfaces.case_repository import CaseRepository
 
@@ -235,7 +238,25 @@ class PostgresCaseRepository(CaseRepository):
                     "target": f"case_{case_id}",
                     "label": "arrest event for",
                 })
-            return {"nodes": nodes, "edges": edges}
+
+            # Reuses get_case_by_id()/get_mo_extraction() rather than
+            # duplicating their joins -- the small extra round-trip cost
+            # is what lets a frontend hover tooltip show real case
+            # context (and MO, if already extracted) with zero extra
+            # fetches of its own, since it's already on this payload.
+            case_summary = self.get_case_by_id(case_id)
+            mo = self.get_mo_extraction(case_id)
+            brief = (case_summary or {}).get("brief") or ""
+            case_context = {
+                "crime_type": (case_summary or {}).get("crime_type"),
+                "district": (case_summary or {}).get("district"),
+                "date": (case_summary or {}).get("date"),
+                "brief": brief[:200] + ("..." if len(brief) > 200 else ""),
+                "mo_summary": mo["mo_summary"] if mo else None,
+                "keywords": mo["keywords"] if mo else [],
+            }
+
+            return {"nodes": nodes, "edges": edges, "case_context": case_context}
         finally:
             session.close()
 
@@ -491,5 +512,92 @@ class PostgresCaseRepository(CaseRepository):
                 }
                 for r in rows
             ]
+        finally:
+            session.close()
+
+    def get_mo_extraction(self, case_id: int) -> dict[str, Any] | None:
+        session = get_session()
+        try:
+            row = session.query(CaseMoExtraction).filter_by(case_id=case_id).first()
+            if not row:
+                return None
+            return {
+                "mo_summary": row.mo_summary,
+                "keywords": json.loads(row.keywords) if row.keywords else [],
+            }
+        finally:
+            session.close()
+
+    def save_mo_extraction(
+        self, case_id: int, mo_summary: str | None, keywords: list[str]
+    ) -> None:
+        # Atomic upsert, not query-then-insert -- two concurrent requests
+        # for the same not-yet-extracted case (e.g. "Extract MO" racing
+        # "Find Similar-MO Cases", or a double-click) could otherwise both
+        # see no existing row and both INSERT, with the second hitting a
+        # primary-key violation on case_id.
+        session = get_session()
+        try:
+            stmt = pg_insert(CaseMoExtraction).values(
+                case_id=case_id,
+                mo_summary=mo_summary,
+                keywords=json.dumps(keywords),
+                extracted_at=datetime.now(timezone.utc),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[CaseMoExtraction.case_id],
+                set_={
+                    "mo_summary": stmt.excluded.mo_summary,
+                    "keywords": stmt.excluded.keywords,
+                    "extracted_at": stmt.excluded.extracted_at,
+                },
+            )
+            session.execute(stmt)
+            session.commit()
+        finally:
+            session.close()
+
+    def get_similar_mo_cases(
+        self, case_id: int, keywords: list[str], min_shared: int = 2, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        session = get_session()
+        try:
+            target_crime_sub_head_id = (
+                session.query(CaseMaster.CrimeMinorHeadID)
+                .filter(CaseMaster.CaseMasterID == case_id)
+                .scalar()
+            )
+            target_keyword_set = {k.strip().lower() for k in keywords if k.strip()}
+            if target_crime_sub_head_id is None or not target_keyword_set:
+                return []
+
+            rows = (
+                session.query(
+                    CaseMoExtraction.case_id, CaseMoExtraction.mo_summary,
+                    CaseMoExtraction.keywords, CaseMaster.CrimeNo,
+                    District.DistrictName, CrimeSubHead.CrimeHeadName,
+                    CaseMaster.CrimeRegisteredDate,
+                )
+                .join(CaseMaster, CaseMoExtraction.case_id == CaseMaster.CaseMasterID)
+                .join(District, CaseMaster.DistrictID == District.DistrictID)
+                .join(CrimeSubHead, CaseMaster.CrimeMinorHeadID == CrimeSubHead.CrimeSubHeadID)
+                .filter(CaseMaster.CrimeMinorHeadID == target_crime_sub_head_id)
+                .filter(CaseMoExtraction.case_id != case_id)
+                .all()
+            )
+
+            scored: list[dict[str, Any]] = []
+            for r in rows:
+                candidate_keywords = json.loads(r[2]) if r[2] else []
+                candidate_keyword_set = {k.strip().lower() for k in candidate_keywords}
+                shared = sorted(target_keyword_set & candidate_keyword_set)
+                if len(shared) >= min_shared:
+                    scored.append({
+                        "case_id": r[0], "mo_summary": r[1],
+                        "crime_no": r[3], "district": r[4], "crime_type": r[5],
+                        "date": str(r[6]), "shared_keywords": shared,
+                    })
+            scored.sort(key=lambda c: len(c["shared_keywords"]), reverse=True)
+            return scored[:limit]
         finally:
             session.close()
