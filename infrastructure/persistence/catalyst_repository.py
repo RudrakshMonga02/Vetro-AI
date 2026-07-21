@@ -25,6 +25,7 @@ exceeds this. Either trim the dummy dataset before migrating, or
 request production environment access from organizers.
 """
 import os
+from datetime import date, datetime
 from typing import Any
 
 import zcatalyst_sdk
@@ -45,6 +46,16 @@ def _get_app():
     (typically CATALYST_PROJECT_ID, service account / OAuth token).
     """
     return zcatalyst_sdk.initialize()
+
+
+def _zcql_datetime(value: datetime) -> str:
+    """Format a Python datetime as the Catalyst ZCQL DateTime literal."""
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _escape_zcql_literal(value: str) -> str:
+    """Quote a user-selected text filter before including it in ZCQL."""
+    return value.replace("'", "''")
 
 
 class CatalystCaseRepository(CaseRepository):
@@ -198,29 +209,104 @@ class CatalystCaseRepository(CaseRepository):
     def get_cases_for_map(
         self, limit: int = 5000, crime_type: str | None = None
     ) -> list[dict[str, Any]]:
-        # NOTE: crime_type filter not yet wired into the ZCQL query below --
-        # untested against a real Catalyst project either way (see module
-        # docstring), so this param is accepted for interface compatibility
-        # but not yet applied. Add a WHERE clause here once this backend
-        # is actually being implemented for real.
-        query = f"""
-            SELECT CaseMaster.CaseMasterID, CaseMaster.latitude, CaseMaster.longitude,
-                   CrimeSubHead.CrimeHeadName, CaseMaster.CrimeRegisteredDate
-            FROM CaseMaster
-            JOIN CrimeSubHead ON CaseMaster.CrimeMinorHeadID = CrimeSubHead.CrimeSubHeadID
-            WHERE CaseMaster.latitude IS NOT NULL
-            LIMIT 0,{limit}
-        """
-        result = self.zcql.execute_query(query)
+        records = self.get_hotspot_records(limit=limit, crime_type=crime_type)
         return [
             {
-                "case_id": r["CaseMaster"]["CaseMasterID"],
-                "lat": float(r["CaseMaster"]["latitude"]),
-                "lng": float(r["CaseMaster"]["longitude"]),
-                "crime_type": r["CrimeSubHead"]["CrimeHeadName"],
-                "date": str(r["CaseMaster"]["CrimeRegisteredDate"]),
+                "case_id": record["case_id"],
+                "lat": record["lat"],
+                "lng": record["lng"],
+                "crime_type": record["crime_type"],
+                "date": str(record["crime_registered_date"]),
             }
-            for r in result
+            for record in records
+        ]
+
+    def get_hotspot_records(
+        self,
+        *,
+        limit: int = 5000,
+        crime_type: str | None = None,
+        incident_start: datetime | None = None,
+        incident_end: datetime | None = None,
+        registered_start: date | None = None,
+        registered_end: date | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch schema-grounded map points through ZCQL.
+
+        Catalyst permits at most 300 SELECT rows per request, therefore this
+        method pages results rather than silently dropping records. Every value
+        interpolated into the query is either an internally constructed date or
+        an escaped crime-type filter.
+        """
+        conditions = [
+            "CaseMaster.latitude IS NOT NULL",
+            "CaseMaster.longitude IS NOT NULL",
+        ]
+
+        if incident_start:
+            conditions.append(
+                f"CaseMaster.IncidentFromDate >= '{_zcql_datetime(incident_start)}'"
+            )
+        if incident_end:
+            conditions.append(
+                f"CaseMaster.IncidentFromDate < '{_zcql_datetime(incident_end)}'"
+            )
+        if registered_start:
+            conditions.append(
+                f"CaseMaster.CrimeRegisteredDate >= '{registered_start.isoformat()}'"
+            )
+        if registered_end:
+            conditions.append(
+                f"CaseMaster.CrimeRegisteredDate < '{registered_end.isoformat()}'"
+            )
+        if crime_type:
+            conditions.append(
+                "CrimeSubHead.CrimeHeadName = "
+                f"'{_escape_zcql_literal(crime_type)}'"
+            )
+
+        order_column = (
+            "CaseMaster.IncidentFromDate"
+            if incident_start or incident_end
+            else "CaseMaster.CrimeRegisteredDate"
+        )
+        select_prefix = f"""
+            SELECT CaseMaster.CaseMasterID, CaseMaster.latitude, CaseMaster.longitude,
+                   CaseMaster.CrimeMajorHeadID, CaseMaster.IncidentFromDate,
+                   CaseMaster.CrimeRegisteredDate, CrimeSubHead.CrimeHeadName
+            FROM CaseMaster
+            JOIN CrimeSubHead ON CaseMaster.CrimeMinorHeadID = CrimeSubHead.CrimeSubHeadID
+            WHERE {' AND '.join(conditions)}
+            ORDER BY {order_column} DESC
+        """
+
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        safe_limit = max(1, min(int(limit), 5000))
+
+        while offset < safe_limit:
+            page_size = min(300, safe_limit - offset)
+            query = f"{select_prefix} LIMIT {offset},{page_size}"
+            page = self.zcql.execute_query(query)
+            if not page:
+                break
+
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+        return [
+            {
+                "case_id": row["CaseMaster"]["CaseMasterID"],
+                "lat": float(row["CaseMaster"]["latitude"]),
+                "lng": float(row["CaseMaster"]["longitude"]),
+                "crime_type": row["CrimeSubHead"]["CrimeHeadName"],
+                "crime_major_head_id": row["CaseMaster"].get("CrimeMajorHeadID"),
+                "incident_from_date": row["CaseMaster"].get("IncidentFromDate"),
+                "crime_registered_date": row["CaseMaster"].get("CrimeRegisteredDate"),
+            }
+            for row in rows
         ]
 
     def get_case_network(self, case_id: int) -> dict[str, Any]:

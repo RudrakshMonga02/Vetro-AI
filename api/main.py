@@ -39,16 +39,16 @@ app = FastAPI(title="Vetro AI — KSP Crime Data Platform", version="0.1.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS origins come from env (CORS_ALLOWED_ORIGINS, comma-separated), not a wildcard.
-# .env.example already defines this var for local dev; set it to your real deployed
-# frontend origin(s) in the AppSail console before/at deploy time.
+# CORS supports a permissive local-development mode so a Vite dev server can
+# always receive structured API errors. In production set
+# CORS_ALLOW_ALL_ORIGINS=false and provide the explicit deployed origins.
 _cors_origins_env = os.environ.get("CORS_ALLOWED_ORIGINS", "")
 _allowed_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+_allow_all_origins = os.environ.get("CORS_ALLOW_ALL_ORIGINS", "true").lower() in {
+    "1", "true", "yes",
+}
 
-if not _allowed_origins:
-    # Fail loudly rather than silently falling back to a wildcard in a deployed
-    # environment -- an empty/misconfigured CORS_ALLOWED_ORIGINS should be caught
-    # at startup, not discovered later as "why can't the frontend reach the API".
+if not _allow_all_origins and not _allowed_origins:
     raise RuntimeError(
         "CORS_ALLOWED_ORIGINS is not set. Set it in .env (local) or the AppSail "
         "console (deployed) to a comma-separated list of allowed frontend origins."
@@ -56,8 +56,10 @@ if not _allowed_origins:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
+    # Wildcard origins and credentialed cookies are mutually exclusive in
+    # browsers. This API uses header-based owner tokens, not browser cookies.
+    allow_origins=["*"] if _allow_all_origins else _allowed_origins,
+    allow_credentials=False if _allow_all_origins else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

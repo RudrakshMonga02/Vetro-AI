@@ -3,8 +3,10 @@ Postgres/Supabase implementation of CaseRepository, using the SQLAlchemy
 models already defined in db/models.py. This is what Stage 2 (FastAPI)
 uses while developing against Supabase.
 """
+
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+
 from typing import Any
 
 from sqlalchemy import func
@@ -153,23 +155,66 @@ class PostgresCaseRepository(CaseRepository):
     def get_cases_for_map(
         self, limit: int = 5000, crime_type: str | None = None
     ) -> list[dict[str, Any]]:
+        records = self.get_hotspot_records(limit=limit, crime_type=crime_type)
+        return [
+            {
+                "case_id": record["case_id"],
+                "lat": record["lat"],
+                "lng": record["lng"],
+                "crime_type": record["crime_type"],
+                "date": str(record["crime_registered_date"]),
+            }
+            for record in records
+        ]
+
+    def get_hotspot_records(
+        self,
+        *,
+        limit: int = 5000,
+        crime_type: str | None = None,
+        incident_start: datetime | None = None,
+        incident_end: datetime | None = None,
+        registered_start: date | None = None,
+        registered_end: date | None = None,
+    ) -> list[dict[str, Any]]:
         session = get_session()
         try:
             q = (
                 session.query(
                     CaseMaster.CaseMasterID, CaseMaster.latitude, CaseMaster.longitude,
-                    CrimeSubHead.CrimeHeadName, CaseMaster.CrimeRegisteredDate,
+                    CrimeSubHead.CrimeHeadName, CaseMaster.CrimeMajorHeadID,
+                    CaseMaster.IncidentFromDate, CaseMaster.CrimeRegisteredDate,
                 )
                 .join(CrimeSubHead, CaseMaster.CrimeMinorHeadID == CrimeSubHead.CrimeSubHeadID)
                 .filter(CaseMaster.latitude.isnot(None))
+                .filter(CaseMaster.longitude.isnot(None))
             )
             if crime_type:
                 q = q.filter(CrimeSubHead.CrimeHeadName == crime_type)
-            rows = q.limit(limit).all()
+            if incident_start:
+                q = q.filter(CaseMaster.IncidentFromDate >= incident_start)
+            if incident_end:
+                q = q.filter(CaseMaster.IncidentFromDate < incident_end)
+            if registered_start:
+                q = q.filter(CaseMaster.CrimeRegisteredDate >= registered_start)
+            if registered_end:
+                q = q.filter(CaseMaster.CrimeRegisteredDate < registered_end)
+
+            order_column = (
+                CaseMaster.IncidentFromDate
+                if incident_start or incident_end
+                else CaseMaster.CrimeRegisteredDate
+            )
+            rows = q.order_by(order_column.desc()).limit(limit).all()
             return [
                 {
-                    "case_id": r[0], "lat": float(r[1]), "lng": float(r[2]),
-                    "crime_type": r[3], "date": str(r[4]),
+                    "case_id": r[0],
+                    "lat": float(r[1]),
+                    "lng": float(r[2]),
+                    "crime_type": r[3],
+                    "crime_major_head_id": r[4],
+                    "incident_from_date": r[5],
+                    "crime_registered_date": r[6],
                 }
                 for r in rows
             ]
