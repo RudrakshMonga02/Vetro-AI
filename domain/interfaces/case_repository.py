@@ -11,6 +11,7 @@ factory constructs (infrastructure/persistence/repository_factory.py),
 never touching calling code.
 """
 from abc import ABC, abstractmethod
+from datetime import date, datetime
 from typing import Any
 
 
@@ -67,6 +68,22 @@ class CaseRepository(ABC):
         """Return [{'case_id': int, 'lat': float, 'lng': float, 'crime_type': str, 'date': str}, ...]
         for hotspot map, optionally filtered to one crime type. case_id lets the frontend
         deep-link a specific case into the Network Graph tab."""
+        ...
+
+    @abstractmethod
+    def get_hotspot_records(
+        self,
+        *,
+        limit: int = 5000,
+        crime_type: str | None = None,
+        incident_start: datetime | None = None,
+        incident_end: datetime | None = None,
+        registered_start: date | None = None,
+        registered_end: date | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return CaseMaster map records with both incident and registration
+        timestamps plus CrimeMajorHeadID. The map route uses the same method
+        for historical display filters and current early-warning analysis."""
         ...
 
     @abstractmethod

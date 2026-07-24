@@ -17,6 +17,7 @@ from typing import Any
 
 from api.services.response_cache import cached_or_compute
 from domain.interfaces.case_repository import CaseRepository
+from api.middleware.auth import OfficerContext
 
 AGGREGATE_KEYWORDS = [
     "how many", "count", "most", "least", "highest", "lowest", "trend",
@@ -37,7 +38,7 @@ ENTITY_LIST_KEYWORDS = [
 
 class QueryStrategy(ABC):
     @abstractmethod
-    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
+    def build_context(self, query: str, repo: CaseRepository, officer: OfficerContext | None = None) -> tuple[str, list[dict] | None]:
         """Return (context_text, citations). context_text feeds into the
         LLM prompt as before. citations is None for strategies with no
         discrete, document-level sources -- SQL aggregates and entity
@@ -61,11 +62,12 @@ class SQLQueryStrategy(QueryStrategy):
     turn -- a "how many cases" question was paying the same ~9-10s
     round-trip the districts query was measured at before caching."""
 
-    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
-        total = cached_or_compute("analytics:total_count", lambda: repo.get_total_case_count())
-        district_counts = cached_or_compute("analytics:districts", lambda: repo.get_district_counts())
-        crime_counts = cached_or_compute("analytics:crime_types:all", lambda: repo.get_crime_type_counts())
-        trend = cached_or_compute("analytics:trend:all:all", lambda: repo.get_monthly_trend())
+    def build_context(self, query: str, repo: CaseRepository, officer: OfficerContext | None = None) -> tuple[str, list[dict] | None]:
+        scope = officer.cache_key if officer else "unscoped"
+        total = cached_or_compute(f"analytics:total_count:{scope}", lambda: repo.get_total_case_count(officer=officer))
+        district_counts = cached_or_compute(f"analytics:districts:{scope}", lambda: repo.get_district_counts(officer=officer))
+        crime_counts = cached_or_compute(f"analytics:crime_types:all:{scope}", lambda: repo.get_crime_type_counts(officer=officer))
+        trend = cached_or_compute(f"analytics:trend:all:all:{scope}", lambda: repo.get_monthly_trend(officer=officer))
 
         # Exact total, from a real COUNT query -- NOT derived by having
         # the LLM sum the (possibly truncated) breakdown below. This was
@@ -102,8 +104,8 @@ class EntityListStrategy(QueryStrategy):
     def __init__(self, limit: int = 50):
         self.limit = limit
 
-    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
-        accused = repo.get_accused_list(limit=self.limit)
+    def build_context(self, query: str, repo: CaseRepository, officer: OfficerContext | None = None) -> tuple[str, list[dict] | None]:
+        accused = repo.get_accused_list(limit=self.limit, officer=officer)
         if not accused:
             return "No accused records found.", None
 
@@ -130,7 +132,7 @@ class SemanticSearchStrategy(QueryStrategy):
     def __init__(self, top_k: int = 5):
         self.top_k = top_k
 
-    def build_context(self, query: str, repo: CaseRepository) -> tuple[str, list[dict] | None]:
+    def build_context(self, query: str, repo: CaseRepository, officer: OfficerContext | None = None) -> tuple[str, list[dict] | None]:
         import os
         import chromadb
         from google import genai
@@ -144,9 +146,10 @@ class SemanticSearchStrategy(QueryStrategy):
         chroma_client = chromadb.PersistentClient(path="./chroma_store")
         collection = chroma_client.get_or_create_collection(name="fir_cases")
 
+        where = {"district": officer.jurisdiction_id} if officer and officer.role == "DISTRICT_SP" else None
         results = collection.query(
             query_embeddings=[query_embedding], n_results=self.top_k,
-            include=["documents", "metadatas"],  # ids come back by default
+            include=["documents", "metadatas"], where=where,
         )
         ids = results.get("ids", [[]])[0]
         docs = results.get("documents", [[]])[0]
@@ -161,16 +164,19 @@ class SemanticSearchStrategy(QueryStrategy):
         # metadata has no crime_no (only district/crime_type/date/
         # status), so case_id (== CaseMasterID) is the identifier the
         # frontend links against, not a human FIR number.
+        authorized = [(id_, doc, m) for id_, doc, m in zip(ids, docs, metas) if officer is None or repo.get_case_by_id(int(id_), officer=officer)]
+        if not authorized:
+            return "No matching case records within your jurisdiction.", None
         citations = [
             {
                 "case_id": id_, "district": m.get("district"),
                 "crime_type": m.get("crime_type"), "date": m.get("date"),
                 "status": m.get("status"),
             }
-            for id_, m in zip(ids, metas)
+            for id_, _, m in authorized
         ]
 
-        return "Relevant case records:\n" + "\n---\n".join(docs), citations
+        return "Relevant case records:\n" + "\n---\n".join(doc for _, doc, _ in authorized), citations
 
 
 def classify_query(query: str) -> QueryStrategy:

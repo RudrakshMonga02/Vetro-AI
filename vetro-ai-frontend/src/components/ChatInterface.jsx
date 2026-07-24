@@ -1,16 +1,14 @@
 import { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Send, Loader2, FileDown, Mic, MicOff, Volume2, VolumeX } from "lucide-react";
-import { AUTH_HEADERS } from "../lib/ownerToken";
-import { API_BASE } from "../lib/apiClient";
+import { getOwnerHeaders } from "../lib/ownerToken";
+import { useAuth } from "../context/AuthContext";
+import { API_BASE, getOfficerHeaders } from "../lib/apiClient";
 import { exportConversationToPdf } from "../lib/exportPdf";
 import MarkdownMessage from "./MarkdownMessage";
 import {
   isSpeechRecognitionSupported,
-  isSpeechSynthesisSupported,
   createRecognizer,
-  speak,
-  stopSpeaking,
 } from "../lib/speechRecognition";
 
 /**
@@ -37,6 +35,24 @@ const CITATION_SENTINEL = "\n\n<<<VETRO_CITATIONS>>>\n";
 const FOLLOWUP_SENTINEL = "\n\n<<<VETRO_FOLLOWUPS>>>\n";
 
 const VOICE_LANGS = { en: "en-IN", kn: "kn-IN" };
+
+/** Convert a rendered AI answer into natural speech. Keep Kannada letters and
+ * ordinary punctuation intact while removing visual/UI-only artifacts. */
+function sanitizeSpeechText(text) {
+  return text
+    .replace(/<<<VETRO_[A-Z_]+>>>/g, "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!?(?:\[([^\]]*)\]\([^)]*\))/g, "$1")
+    .replace(/https?:\/\/[^\s)\]]+/gi, "")
+    .replace(/\[(?:\d+|source|citation|case\s*#?\d+)[^\]]*\]/gi, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^\s*(?:[-*+] |\d+[.)] )/gm, "")
+    .replace(/[~*_>#|]/g, " ")
+    .replace(/\b[A-Za-z0-9_-]{20,}\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function useAutoScroll(dep) {
   const ref = useRef(null);
@@ -83,6 +99,7 @@ function splitMetadata(accumulated) {
 
 export default function ChatInterface({ conversationId, conversationTitle, onMessageSent }) {
   const navigate = useNavigate();
+  const { officer } = useAuth();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -90,12 +107,16 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
   const [isExporting, setIsExporting] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [speakingIndex, setSpeakingIndex] = useState(null);
-  const [voiceLang, setVoiceLang] = useState("en");
+  // Controls investigator-facing response language and browser speech tools.
+  const [language, setLanguage] = useState("en");
   const scrollRef = useAutoScroll(messages);
   const recognizerRef = useRef(null);
+  const audioRef = useRef(null);
+  const audioRequestIdRef = useRef(0);
+  const finalTranscriptRef = useRef("");
+  const recognitionFailedRef = useRef(false);
 
   const micSupported = isSpeechRecognitionSupported();
-  const speakerSupported = isSpeechSynthesisSupported();
 
   // Reload this conversation's persisted history whenever the active
   // conversation changes (sidebar switch) -- this is what makes each
@@ -110,7 +131,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
     let cancelled = false;
     setIsLoadingHistory(true);
 
-    fetch(`${API_BASE}/conversations/${conversationId}/messages`, { headers: AUTH_HEADERS })
+    fetch(`${API_BASE}/conversations/${conversationId}/messages`, { headers: { ...getOwnerHeaders(), ...getOfficerHeaders() } })
       .then((res) => {
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
         return res.json();
@@ -141,13 +162,20 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
     };
   }, [conversationId]);
 
+  useEffect(() => {
+    // Never render a prior officer's client-side transcript during account switching.
+    setMessages([]);
+    setInput("");
+    stopAudio();
+  }, [officer?.user_id]);
+
   // Stop any in-flight recognition/speech when switching conversations,
   // so a lingering mic session or read-aloud doesn't bleed across
   // "Investigation" threads.
   useEffect(() => {
     return () => {
       recognizerRef.current?.stop();
-      stopSpeaking();
+      stopAudio();
     };
   }, [conversationId]);
 
@@ -164,8 +192,16 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
     try {
       const res = await fetch(`${API_BASE}/chat/`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
-        body: JSON.stringify({ query, conversation_id: conversationId }),
+        headers: {
+          "Content-Type": "application/json",
+          ...getOwnerHeaders(),
+          ...getOfficerHeaders(),
+        },
+        body: JSON.stringify({
+          query,
+          conversation_id: conversationId,
+          language,
+        }),
       });
 
       if (!res.ok || !res.body) {
@@ -198,6 +234,10 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
         next[next.length - 1] = { ...next[next.length - 1], text: displayText, citations, followups };
         return next;
       });
+      // -1 denotes the automatically narrated latest response; it keeps
+      // the global Stop audio control visible without tying playback to a
+      // stale message-array index.
+      void playBackendAudio(displayText, -1);
 
       // Let the parent know a message completed -- this is what
       // triggers the sidebar to refresh (picks up auto-generated
@@ -243,32 +283,100 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
       recognizerRef.current?.stop();
       return;
     }
+
+    stopAudio();
+    finalTranscriptRef.current = "";
+    recognitionFailedRef.current = false;
     const recognizer = createRecognizer({
-      lang: VOICE_LANGS[voiceLang],
-      onResult: (transcript) => setInput((prev) => (prev ? `${prev} ${transcript}` : transcript)),
-      onEnd: () => setIsListening(false),
-      onError: () => setIsListening(false),
+      lang: VOICE_LANGS[language],
+      onResult: (transcript) => {
+        finalTranscriptRef.current = transcript.trim();
+        setInput(finalTranscriptRef.current);
+      },
+      onEnd: () => {
+        setIsListening(false);
+        const transcript = finalTranscriptRef.current;
+        finalTranscriptRef.current = "";
+        if (!recognitionFailedRef.current && transcript && !isStreaming) {
+          handleSend(transcript);
+        }
+      },
+      onError: () => {
+        recognitionFailedRef.current = true;
+        setIsListening(false);
+      },
     });
     recognizerRef.current = recognizer;
     setIsListening(true);
     recognizer.start();
   }
 
+  function stopAudio() {
+    // Invalidates an in-flight TTS fetch so a cancelled response cannot
+    // begin playing after the officer has pressed Stop audio.
+    audioRequestIdRef.current += 1;
+
+    const activeAudio = audioRef.current;
+    if (activeAudio) {
+      activeAudio.audio.pause();
+      activeAudio.audio.src = "";
+      URL.revokeObjectURL(activeAudio.url);
+      audioRef.current = null;
+    }
+    setSpeakingIndex(null);
+  }
+
+  async function playBackendAudio(text, messageIndex = -1) {
+    const speechText = sanitizeSpeechText(text);
+    if (!speechText) return;
+
+    stopAudio();
+    const requestId = audioRequestIdRef.current;
+
+    try {
+      const response = await fetch(`${API_BASE}/audio/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getOwnerHeaders(), ...getOfficerHeaders() },
+        body: JSON.stringify({ text: speechText, language }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`TTS server returned ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      if (requestId !== audioRequestIdRef.current) return;
+
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = { audio, url };
+      setSpeakingIndex(messageIndex);
+
+      const cleanup = () => {
+        if (audioRef.current?.audio === audio) {
+          URL.revokeObjectURL(url);
+          audioRef.current = null;
+          setSpeakingIndex(null);
+        }
+      };
+
+      audio.onended = cleanup;
+      audio.onerror = cleanup;
+      await audio.play();
+    } catch (error) {
+      if (requestId === audioRequestIdRef.current) {
+        console.error("Backend TTS failed:", error);
+        setSpeakingIndex(null);
+      }
+    }
+  }
+
   function toggleSpeak(index, text) {
-    if (!speakerSupported) return;
     if (speakingIndex === index) {
-      stopSpeaking();
-      setSpeakingIndex(null);
+      stopAudio();
       return;
     }
-    speak(text, VOICE_LANGS[voiceLang]);
-    setSpeakingIndex(index);
-    const check = setInterval(() => {
-      if (!window.speechSynthesis.speaking) {
-        setSpeakingIndex(null);
-        clearInterval(check);
-      }
-    }, 300);
+    void playBackendAudio(text, index);
   }
 
   return (
@@ -282,14 +390,25 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
           <p className="text-xs text-[#6B7488] mt-0.5">Karnataka SCRB &middot; Query Interface</p>
         </div>
         <div className="flex items-center gap-4">
-          {(micSupported || speakerSupported) && (
+          <button
+            type="button"
+            onClick={() => setLanguage((current) => (current === "en" ? "kn" : "en"))}
+            aria-label="Change chat language"
+            title="Change response and voice language"
+            className="text-xs font-mono tracking-wider text-[#6B7488] hover:text-[#D4A24C]
+                       border border-[#2A3348] rounded px-2 py-1 transition-colors"
+          >
+            {language === "en" ? "English" : "ಕನ್ನಡ"}
+          </button>
+          {speakingIndex !== null && (
             <button
-              onClick={() => setVoiceLang((l) => (l === "en" ? "kn" : "en"))}
-              title="Voice language"
-              className="text-xs font-mono uppercase tracking-wider text-[#6B7488] hover:text-[#D4A24C]
-                         border border-[#2A3348] rounded px-2 py-1 transition-colors"
+              type="button"
+              onClick={stopAudio}
+              title="Stop audio"
+              className="flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-[#B0503C]
+                         hover:text-[#E06950] transition-colors"
             >
-              {voiceLang === "en" ? "EN" : "ಕನ್ನಡ"}
+              <VolumeX className="w-3.5 h-3.5" /> Stop audio
             </button>
           )}
           <button
@@ -354,7 +473,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
                     <span className={`font-mono text-[10px] uppercase tracking-wider ${msg.error ? "text-[#B0503C]" : "text-[#3A6B4C]"}`}>
                       {msg.error ? "Error" : "Result"}
                     </span>
-                    {speakerSupported && msg.text && !isStreaming && (
+                    {msg.text && !isStreaming && (
                       <button
                         onClick={() => toggleSpeak(i, msg.text)}
                         title="Read answer aloud"
@@ -422,7 +541,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
           {micSupported && (
             <button
               onClick={toggleListening}
-              disabled={!conversationId}
+              disabled={!conversationId || isStreaming}
               title={isListening ? "Stop listening" : "Speak your query"}
               className={`rounded px-3 py-3 border transition-colors shrink-0 disabled:opacity-30
                 ${isListening
@@ -436,7 +555,7 @@ export default function ChatInterface({ conversationId, conversationTitle, onMes
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Enter query..."
+            placeholder={language === "kn" ? "ನಿಮ್ಮ ಪ್ರಶ್ನೆಯನ್ನು ನಮೂದಿಸಿ..." : "Enter query..."}
             rows={1}
             disabled={!conversationId}
             className="flex-1 bg-[#151B2E] border border-[#2A3348] rounded px-4 py-3 text-sm

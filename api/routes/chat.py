@@ -18,12 +18,15 @@ docs/PRD.md:
     route triggers a real, billed Gemini call per request and
     previously had zero throttling in front of it.
 """
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.rate_limiter import limiter as _limiter
-from api.routes.conversations import require_owner_token
+from api.middleware.auth import OfficerContext, get_current_officer
+from api.routes.conversations import require_owner_token, scoped_owner_token
 from api.services.chat_service import ChatService
 from infrastructure.persistence.conversation_repository_factory import (
     get_conversation_repository,
@@ -40,6 +43,10 @@ QUERY_MAX_LENGTH = 2000
 class ChatRequest(BaseModel):
     query: str = Field(max_length=QUERY_MAX_LENGTH)
     conversation_id: int
+    language: Literal["en", "kn"] = Field(
+        default="en",
+        description="Language for the investigator-facing response.",
+    )
 
 
 @router.post("/")
@@ -48,6 +55,7 @@ async def chat(
     request: Request,  # required as the first param for slowapi's decorator to find the client IP
     body: ChatRequest,
     owner_token: str = Depends(require_owner_token),
+    officer: OfficerContext = Depends(get_current_officer),
 ):
     # Fail fast with a clear 404 rather than silently creating orphaned
     # messages against a conversation_id that doesn't exist (or isn't
@@ -55,13 +63,20 @@ async def chat(
     # surface as "not found", not succeed into nowhere or leak
     # existence via a different error code.
     repo = get_conversation_repository()
+    owner_token = scoped_owner_token(officer, owner_token)
     if repo.get_conversation(body.conversation_id, owner_token) is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     service = ChatService()
 
     async def generate():
-        async for chunk in service.stream_answer(body.query, body.conversation_id, owner_token):
+        async for chunk in service.stream_answer(
+            body.query,
+            body.conversation_id,
+            owner_token,
+            language=body.language,
+            officer=officer,
+        ):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/plain")

@@ -36,6 +36,10 @@ one category, and provide an English translation of it (if it's already in Engli
 repeat it unchanged). The question may be in English, Kannada, or a Kannada/English mix \
 (Kannalish) -- classify by meaning, not by matching English words.
 
+The investigator selected {language} as the display language. This does NOT change this
+task: the ENGLISH field must always be fluent English because SQL/RAG retrieval is performed
+against English database fields and English Chroma embeddings.
+
 Categories:
 - AGGREGATE: asking for counts, statistics, trends, comparisons, totals, breakdowns \
 (e.g. "how many cases", "which district has the most theft", "monthly trend")
@@ -74,14 +78,20 @@ def _parse_response(raw: str, fallback_query: str) -> tuple[QueryStrategy, str]:
     return _build_strategy(category), english_query
 
 
-async def classify_query_llm(query: str, llm: LLMProvider) -> tuple[QueryStrategy, str]:
+async def classify_query_llm(
+    query: str,
+    llm: LLMProvider,
+    language: str = "en",
+) -> tuple[QueryStrategy, str]:
     """Returns (strategy, english_query). Degrades to the keyword
     heuristic (query itself as the "english_query") if the LLM call
     fails or returns something unparseable -- a classification hiccup
     shouldn't break the chat turn, it should fall back to best-effort
     English-keyword matching same as before this module existed."""
     try:
-        raw = await llm.generate(_CLASSIFY_PROMPT_TEMPLATE.format(query=query))
+        raw = await llm.generate(
+            _CLASSIFY_PROMPT_TEMPLATE.format(query=query, language=language)
+        )
         if not raw or not raw.strip():
             return classify_query_keywords(query), query
         return _parse_response(raw, query)

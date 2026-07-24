@@ -17,7 +17,16 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://postgres:devpass@localhost:5432/ksp_datathon",
 )
 
-engine = create_engine(DATABASE_URL, future=True)
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    # Verify a connection before reuse so a stale Supabase/Postgres socket is
+    # discarded instead of surfacing as "server closed the connection" mid-call.
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=300,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 

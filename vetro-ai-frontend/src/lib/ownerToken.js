@@ -11,4 +11,8 @@ function getOwnerToken() {
   return token;
 }
 
-export const AUTH_HEADERS = { "X-Owner-Token": getOwnerToken() };
+// Resolve at request time: the device token is constant, but the backend
+// binds it to the authenticated officer's user_id before reading history.
+export function getOwnerHeaders() {
+  return { "X-Owner-Token": getOwnerToken() };
+}

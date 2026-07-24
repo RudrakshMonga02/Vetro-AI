@@ -324,6 +324,13 @@ class ChargesheetDetails(Base):
 # Composite indexes that matter most for the analytics/chart queries
 Index("ix_case_district_date", CaseMaster.DistrictID, CaseMaster.CrimeRegisteredDate)
 Index("ix_case_crimehead_date", CaseMaster.CrimeMajorHeadID, CaseMaster.CrimeRegisteredDate)
+Index("idx_case_master_incident_date", CaseMaster.IncidentFromDate)
+Index(
+    "idx_case_master_coordinates",
+    CaseMaster.latitude,
+    CaseMaster.longitude,
+    postgresql_where=CaseMaster.latitude.isnot(None),
+)
 
 
 # ---------- Chat: conversations & messages ----------

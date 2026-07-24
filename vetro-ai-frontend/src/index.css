@@ -40,3 +40,40 @@
   font-weight: 600;
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
+
+/* DivIcons keep clustered points circular while still being compatible with
+   Leaflet.markercluster. The warning variant is deliberately high contrast. */
+.vetro-marker-icon {
+  background: transparent !important;
+  border: 0 !important;
+}
+.vetro-crime-marker {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #d4a24c;
+  box-shadow: 0 1px 5px rgb(0 0 0 / 55%);
+}
+.vetro-crime-marker--emerging {
+  background: #dc2626;
+  animation: vetro-warning-pulse 1.1s infinite;
+}
+.vetro-emerging-ring {
+  animation: vetro-warning-ring 1.1s infinite;
+}
+@keyframes vetro-warning-pulse {
+  70% {
+    box-shadow: 0 0 0 13px rgb(220 38 38 / 0%), 0 1px 5px rgb(0 0 0 / 55%);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgb(220 38 38 / 0%), 0 1px 5px rgb(0 0 0 / 55%);
+  }
+}
+@keyframes vetro-warning-ring {
+  50% {
+    stroke-opacity: 0.25;
+    stroke-width: 8px;
+  }
+}

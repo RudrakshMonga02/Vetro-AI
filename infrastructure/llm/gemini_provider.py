@@ -8,10 +8,16 @@ from typing import AsyncIterator
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 from domain.interfaces.llm_provider import LLMProvider
 
 load_dotenv()
+
+_SYSTEM_INSTRUCTION = """You are a crime-data assistant. Follow the caller's language,
+evidence, formatting, and output instructions exactly. Never emit application transport
+markers such as <<<VETRO_CITATIONS>>> or <<<VETRO_FOLLOWUPS>>>; those are reserved for the
+application server."""
 
 
 class GeminiProvider(LLMProvider):
@@ -31,15 +37,27 @@ class GeminiProvider(LLMProvider):
     def __init__(self, model: str = "gemini-flash-lite-latest"):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = model
+        self.generation_config = types.GenerateContentConfig(
+            system_instruction=_SYSTEM_INSTRUCTION,
+            temperature=0.2,
+        )
 
     async def stream_generate(self, prompt: str) -> AsyncIterator[str]:
         # google-genai's streaming call is sync-generator based;
         # wrap it so the route's async StreamingResponse can consume it.
-        stream = self.client.models.generate_content_stream(model=self.model, contents=prompt)
+        stream = self.client.models.generate_content_stream(
+            model=self.model,
+            contents=prompt,
+            config=self.generation_config,
+        )
         for chunk in stream:
             if chunk.text:
                 yield chunk.text
 
     async def generate(self, prompt: str) -> str:
-        result = self.client.models.generate_content(model=self.model, contents=prompt)
+        result = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=self.generation_config,
+        )
         return result.text or ""
