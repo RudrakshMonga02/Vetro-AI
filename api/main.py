@@ -16,7 +16,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from api.rate_limiter import limiter
-from api.routes import chat, analytics, map_routes, graph, conversations, offenders, sociology
+from api.routes import audio, chat, analytics, map_routes, graph, conversations, offenders, sociology
 
 # Load .env explicitly here, before reading any env vars below. Don't rely on
 # some other imported module (db/connection.py, gemini_provider.py, etc.)
@@ -65,6 +65,7 @@ app.add_middleware(
 )
 
 app.include_router(chat.router, prefix="/chat", tags=["chatbot"])
+app.include_router(audio.router, prefix="/audio", tags=["audio"])
 app.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
 app.include_router(map_routes.router, prefix="/map", tags=["map"])
 app.include_router(graph.router, prefix="/graph", tags=["graph"])

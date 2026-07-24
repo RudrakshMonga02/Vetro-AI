@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
@@ -13,6 +13,7 @@ from api.services.hotspot_intelligence import (
     resolve_incident_window,
     validate_hotspot_filters,
 )
+from api.middleware.auth import OfficerContext, get_current_officer
 from infrastructure.persistence.repository_factory import get_case_repository
 
 router = APIRouter()
@@ -32,6 +33,7 @@ def hotspot_data(
     month: str | None = None,
     season: str | None = None,
     year: int | None = None,
+    officer: OfficerContext = Depends(get_current_officer),
 ):
     """Return map incidents plus live, spatial early-warning clusters.
 
@@ -61,6 +63,7 @@ def hotspot_data(
             crime_type=filters.crime_type,
             incident_start=incident_window[0] if incident_window else None,
             incident_end=incident_window[1] if incident_window else None,
+            officer=officer,
         )
 
         history_start = (now - timedelta(
@@ -71,10 +74,12 @@ def hotspot_data(
             limit=effective_limit,
             registered_start=history_start,
             registered_end=history_end,
+            officer=officer,
         )
 
         payload = build_hotspot_payload(display_rows, history_rows, filters, now=now)
         payload["meta"].update({
+            "security_scope": officer.cache_key,
             "requested_limit": limit,
             "effective_limit": effective_limit,
             "limit_capped": limit > effective_limit,

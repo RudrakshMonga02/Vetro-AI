@@ -16,6 +16,7 @@ docstring for why this is a stopgap, not real multi-user auth.
 """
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
+from api.middleware.auth import OfficerContext, get_current_officer
 
 from infrastructure.persistence.conversation_repository_factory import (
     get_conversation_repository,
@@ -44,10 +45,16 @@ def require_owner_token(
     return x_owner_token
 
 
+def scoped_owner_token(officer: OfficerContext, device_token: str) -> str:
+    """The database key is always bound to a verified officer identity."""
+    return f"{officer.user_id}:{device_token}"
+
+
 @router.post("")
 def create_conversation(
     request: CreateConversationRequest = CreateConversationRequest(),
     owner_token: str = Depends(require_owner_token),
+    officer: OfficerContext = Depends(get_current_officer),
 ):
     repo = get_conversation_repository()
     title = request.title or "New Investigation"
@@ -57,18 +64,19 @@ def create_conversation(
     # same token and list_conversations() can return all of them in
     # one call. See ConversationRepository.create_conversation's
     # docstring for why this can't be server-generated per-conversation.
-    return repo.create_conversation(title=title, owner_token=owner_token)
+    return repo.create_conversation(title=title, owner_token=scoped_owner_token(officer, owner_token))
 
 
 @router.get("")
-def list_conversations(owner_token: str = Depends(require_owner_token)):
+def list_conversations(owner_token: str = Depends(require_owner_token), officer: OfficerContext = Depends(get_current_officer)):
     repo = get_conversation_repository()
-    return repo.list_conversations(owner_token)
+    return repo.list_conversations(scoped_owner_token(officer, owner_token))
 
 
 @router.get("/{conversation_id}/messages")
-def get_messages(conversation_id: int, owner_token: str = Depends(require_owner_token)):
+def get_messages(conversation_id: int, owner_token: str = Depends(require_owner_token), officer: OfficerContext = Depends(get_current_officer)):
     repo = get_conversation_repository()
+    owner_token = scoped_owner_token(officer, owner_token)
     conv = repo.get_conversation(conversation_id, owner_token)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -80,18 +88,19 @@ def rename_conversation(
     conversation_id: int,
     request: RenameConversationRequest,
     owner_token: str = Depends(require_owner_token),
+    officer: OfficerContext = Depends(get_current_officer),
 ):
     repo = get_conversation_repository()
-    renamed = repo.rename_conversation(conversation_id, request.title, owner_token)
+    renamed = repo.rename_conversation(conversation_id, request.title, scoped_owner_token(officer, owner_token))
     if not renamed:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"id": conversation_id, "title": request.title}
 
 
 @router.delete("/{conversation_id}")
-def delete_conversation(conversation_id: int, owner_token: str = Depends(require_owner_token)):
+def delete_conversation(conversation_id: int, owner_token: str = Depends(require_owner_token), officer: OfficerContext = Depends(get_current_officer)):
     repo = get_conversation_repository()
-    deleted = repo.delete_conversation(conversation_id, owner_token)
+    deleted = repo.delete_conversation(conversation_id, scoped_owner_token(officer, owner_token))
     if not deleted:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"deleted": True}

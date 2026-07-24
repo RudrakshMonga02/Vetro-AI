@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db.connection import get_session
@@ -17,8 +17,9 @@ from db.models import (
     CaseMaster, District, CrimeSubHead, CrimeHead, CaseCategory,
     GravityOffence, CaseStatusMaster, Victim, Accused, ArrestSurrender,
     CasteMaster, ReligionMaster, OccupationMaster, ComplainantDetails,
-    ChargesheetDetails, CaseMoExtraction,
+    ChargesheetDetails, CaseMoExtraction, Unit,
 )
+from api.middleware.auth import OfficerContext
 from domain.interfaces.case_repository import CaseRepository
 
 
@@ -34,19 +35,27 @@ def _risk_tier(case_count: int) -> str:
     return "low"
 
 
+def _apply_jurisdiction_scope(query, officer: OfficerContext | None):
+    if officer is None or officer.role == "STATE_DGP":
+        return query
+    if officer.role == "DISTRICT_SP":
+        return query.filter(CaseMaster.DistrictID.in_(select(District.DistrictID).where(District.DistrictName == officer.jurisdiction_id)))
+    return query.filter(CaseMaster.PoliceStationID.in_(select(Unit.UnitID).where(Unit.UnitName == officer.jurisdiction_id)))
+
+
 class PostgresCaseRepository(CaseRepository):
 
-    def get_total_case_count(self) -> int:
+    def get_total_case_count(self, officer: OfficerContext | None = None) -> int:
         session = get_session()
         try:
-            return session.query(func.count(CaseMaster.CaseMasterID)).scalar() or 0
+            return _apply_jurisdiction_scope(session.query(func.count(CaseMaster.CaseMasterID)), officer).scalar() or 0
         finally:
             session.close()
 
-    def get_accused_list(self, limit: int = 50) -> list[dict[str, Any]]:
+    def get_accused_list(self, limit: int = 50, officer: OfficerContext | None = None) -> list[dict[str, Any]]:
         session = get_session()
         try:
-            rows = (
+            query = (
                 session.query(
                     Accused.AccusedName, Accused.AgeYear, Accused.GenderID,
                     CaseMaster.CrimeNo, CrimeSubHead.CrimeHeadName,
@@ -55,7 +64,9 @@ class PostgresCaseRepository(CaseRepository):
                 .join(CaseMaster, Accused.CaseMasterID == CaseMaster.CaseMasterID)
                 .join(CrimeSubHead, CaseMaster.CrimeMinorHeadID == CrimeSubHead.CrimeSubHeadID)
                 .join(CaseStatusMaster, CaseMaster.CaseStatusID == CaseStatusMaster.CaseStatusID)
-                .order_by(CaseMaster.CrimeRegisteredDate.desc())
+            )
+            rows = (
+                _apply_jurisdiction_scope(query, officer).order_by(CaseMaster.CrimeRegisteredDate.desc())
                 .limit(limit)
                 .all()
             )
@@ -69,10 +80,10 @@ class PostgresCaseRepository(CaseRepository):
         finally:
             session.close()
 
-    def get_case_by_id(self, case_id: int) -> dict[str, Any] | None:
+    def get_case_by_id(self, case_id: int, officer: OfficerContext | None = None) -> dict[str, Any] | None:
         session = get_session()
         try:
-            row = (
+            query = (
                 session.query(
                     CaseMaster.CaseMasterID, CaseMaster.CrimeNo, CaseMaster.CrimeRegisteredDate,
                     District.DistrictName, CrimeSubHead.CrimeHeadName, CaseCategory.LookupValue,
@@ -85,8 +96,8 @@ class PostgresCaseRepository(CaseRepository):
                 .join(GravityOffence, CaseMaster.GravityOffenceID == GravityOffence.GravityOffenceID)
                 .join(CaseStatusMaster, CaseMaster.CaseStatusID == CaseStatusMaster.CaseStatusID)
                 .filter(CaseMaster.CaseMasterID == case_id)
-                .first()
             )
+            row = _apply_jurisdiction_scope(query, officer).first()
             if not row:
                 return None
             return {
@@ -100,13 +111,15 @@ class PostgresCaseRepository(CaseRepository):
         finally:
             session.close()
 
-    def get_district_counts(self) -> list[dict[str, Any]]:
+    def get_district_counts(self, officer: OfficerContext | None = None) -> list[dict[str, Any]]:
         session = get_session()
         try:
-            rows = (
+            query = (
                 session.query(District.DistrictName, func.count(CaseMaster.CaseMasterID))
                 .join(CaseMaster, CaseMaster.DistrictID == District.DistrictID)
-                .group_by(District.DistrictName)
+            )
+            rows = (
+                _apply_jurisdiction_scope(query, officer).group_by(District.DistrictName)
                 .order_by(func.count(CaseMaster.CaseMasterID).desc())
                 .all()
             )
@@ -114,7 +127,7 @@ class PostgresCaseRepository(CaseRepository):
         finally:
             session.close()
 
-    def get_crime_type_counts(self, district: str | None = None) -> list[dict[str, Any]]:
+    def get_crime_type_counts(self, district: str | None = None, officer: OfficerContext | None = None) -> list[dict[str, Any]]:
         session = get_session()
         try:
             q = (
@@ -125,7 +138,7 @@ class PostgresCaseRepository(CaseRepository):
                 q = q.join(District, CaseMaster.DistrictID == District.DistrictID).filter(
                     District.DistrictName == district
                 )
-            rows = q.group_by(CrimeSubHead.CrimeHeadName).order_by(
+            rows = _apply_jurisdiction_scope(q, officer).group_by(CrimeSubHead.CrimeHeadName).order_by(
                 func.count(CaseMaster.CaseMasterID).desc()
             ).all()
             return [{"crime_type": r[0], "count": r[1]} for r in rows]
@@ -133,7 +146,7 @@ class PostgresCaseRepository(CaseRepository):
             session.close()
 
     def get_monthly_trend(
-        self, district: str | None = None, crime_type: str | None = None
+        self, district: str | None = None, crime_type: str | None = None, officer: OfficerContext | None = None
     ) -> list[dict[str, Any]]:
         session = get_session()
         try:
@@ -147,7 +160,7 @@ class PostgresCaseRepository(CaseRepository):
                 q = q.join(
                     CrimeSubHead, CaseMaster.CrimeMinorHeadID == CrimeSubHead.CrimeSubHeadID
                 ).filter(CrimeSubHead.CrimeHeadName == crime_type)
-            rows = q.group_by(month_expr).order_by(month_expr).all()
+            rows = _apply_jurisdiction_scope(q, officer).group_by(month_expr).order_by(month_expr).all()
             return [{"month": r[0], "count": r[1]} for r in rows]
         finally:
             session.close()
@@ -176,6 +189,7 @@ class PostgresCaseRepository(CaseRepository):
         incident_end: datetime | None = None,
         registered_start: date | None = None,
         registered_end: date | None = None,
+        officer: OfficerContext | None = None,
     ) -> list[dict[str, Any]]:
         session = get_session()
         try:
@@ -205,7 +219,7 @@ class PostgresCaseRepository(CaseRepository):
                 if incident_start or incident_end
                 else CaseMaster.CrimeRegisteredDate
             )
-            rows = q.order_by(order_column.desc()).limit(limit).all()
+            rows = _apply_jurisdiction_scope(q, officer).order_by(order_column.desc()).limit(limit).all()
             return [
                 {
                     "case_id": r[0],
